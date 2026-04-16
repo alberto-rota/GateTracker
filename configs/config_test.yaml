@@ -1,0 +1,255 @@
+parameters:
+
+  # ===== PROJECT =====
+  PROJECT:
+    value: "EndoMatch"  # Name of the project
+  WANDB_ENTITY:
+    value: ""  # W&B team/user entity (empty uses current logged-in default)
+  RUN:
+    value: ""  # Run name override (empty for auto-generated)
+  NOTES:
+    value: ""  # Free-text notes attached to this run
+
+  # ===== PHASE CONTROL =====
+  PHASE:
+    value: "pretrain"
+  FROM_PRETRAINED_CHECKPOINT:
+    value: ""  # Absolute path to a pretrained checkpoint to resume from (empty to skip)
+  PRETRAINED_DESCRIPTOR_CKPT:
+    value: ""  # Phase 1 descriptor checkpoint to load when PHASE="tracking"
+
+  # ===== DATA =====
+  IMAGE_HEIGHT:
+    value: 384  # Height of input images (px)
+  IMAGE_WIDTH:
+    value: 384  # Width of input images (px)
+  BATCH_SIZE:
+    value: 8  # Test batch size
+  SHUFFLE:
+    value: True  # Shuffle dataset
+  WORKERS:
+    value: 1  # DataLoader worker processes
+  PIN_MEMORY:
+    value: True  # Pin host memory for faster GPU transfers
+  PREFETCH_FACTOR:
+    value: 1  # Batches prefetched per worker
+  FEWFRAMES:
+    value: False  # Debug mode: load only 100 frames
+  TRACKING_ONLY:
+    value: False  # Skip pairwise matching test; only run tracking evaluation
+  RANDOM_POSE_RANGES_OVERRIDE:
+    value: [2.5, 3.25]  # Global override for per-dataset RANDOM_POSE_RANGES [min, max]
+  DATASETS:
+    value:
+      SCARED:
+        PATH: "SCARED"
+        FPS: 32
+        FRAMESKIP: [1,2,4,8,16,24,32]
+        TRAIN_VIDEOS: ["train_v*"]
+        VAL_VIDEOS: ["test_*"]
+        TEST_VIDEOS: ["test_*"]
+        RANDOM_POSE_TRAINING: True
+        RANDOM_POSE_RANGES: [2.5, 3.25]
+        CURRICULUM_FACTOR: 1
+        AUGMENTATION_PROBABILITY: {
+          COLOR: 0.8,
+          GEOMETRIC: 0.0,
+          REVERSE: 0.0,
+          STANDSTILL: 0.0
+        }
+        CROP_ZOOM_FACTOR: 1.0
+
+      CHOLEC80:
+        PATH: "CHOLEC80/videos"
+        FPS: 80
+        FRAMESKIP: [1]
+        TRAIN_VIDEOS: ["train_video02"]
+        TEST_VIDEOS: ["test_video*"]
+        VAL_VIDEOS: ["test_video*"]
+        RANDOM_POSE_TRAINING: True
+        RANDOM_POSE_RANGES: [2.5, 3.25]
+        CURRICULUM_FACTOR: 1
+        AUGMENTATION_PROBABILITY: {
+          COLOR: 0.0,
+          GEOMETRIC: 0.0,
+          REVERSE: 0.0,
+          STANDSTILL: 0.0
+        }
+        CROP_ZOOM_FACTOR: 1.2
+
+      STEREOMIS:
+        PATH: "StereoMIS_Tracking"
+        FPS: 4
+        FRAMESKIP: [1,2]
+        TRAIN_VAL_SPLIT: 0.7
+        TRAIN_VIDEOS: ["train_*"]
+        VAL_VIDEOS: ["test_*"]
+        TEST_VIDEOS: ["test_*"]
+        RANDOM_POSE_TRAINING: True
+        RANDOM_POSE_RANGES: [2.5, 3.25]
+        CURRICULUM_FACTOR: 1
+        AUGMENTATION_PROBABILITY: {
+          COLOR: 0.8,
+          GEOMETRIC: 0.0,
+          REVERSE: 0.0,
+          STANDSTILL: 0.0
+        }
+        CROP_ZOOM_FACTOR: 1.2
+
+  # ===== BACKBONE =====
+  DINO_MODEL_NAME:
+    value: "facebook/dinov3-vitb16-pretrain-lvd1689m"  # HuggingFace DINOv3 model identifier
+  DINO_LAYERS:
+    value: "all"  # "all" | "auto" | comma-separated layer indices (e.g. "3,7,11")
+
+  # ===== DESCRIPTOR FUSION =====
+  FUSION_HEAD:
+    value: "register_gated_hierarchical"  # Hierarchical gated descriptor fusion head
+  FUSION_GATE_TEMPERATURE:
+    value: 2.0  # Softer gate keeps multiple hierarchy levels active
+  FUSION_UNIFORM_MIXING:
+    value: 0.10  # Uniform prior fraction to prevent hard layer collapse
+  FUSION_LAYER_DROPOUT:
+    value: 0.10  # Dropout probability on gate candidates during training
+  FUSION_GATE_LOGIT_BOUND:
+    value: 1.5  # Clamp gate logits before softmax to avoid one-hot saturation
+
+  # ===== MATCHING =====
+  TRIPLETS_TO_MINE:
+    value: 50  # Number of random query points sampled for pseudo-GT correspondence generation
+  PATCH_MATCHING_SCORE_THRESHOLD:
+    value: 0.975  # Minimum cosine similarity to accept a patch match
+  PIXEL_MATCHING_SCORE_THRESHOLD:
+    value: 0.15  # Lowe ratio-test threshold for pixel-level matching
+  MIN_MATCHES_TO_COLLECT:
+    value: 256  # Minimum matches to gather before geometric verification
+  MAX_MATCHES_TO_PROCESS:
+    value: 500  # Cap matches per batch to prevent OOM
+  MAX_EPIPOLAR_DISTANCE:
+    value: 2  # Max epipolar distance (px) for inlier classification
+  SCORE_WEIGHTS:
+    value: {
+      DESCRIPTOR: 0.2,
+      REFINEMENT: 0.3,
+      EPIPOLAR: 0.6
+    }
+  USE_CORRESPONDENCE_CONFIDENCE:
+    value: True  # Down-weight low-confidence pseudo-correspondences from warp mask
+  CONFIDENCE_PHOTOMETRIC_BETA:
+    value: 6.0  # Converts warp-vs-target photometric error into confidence weight
+  CONFIDENCE_PATCH_VALID_RATIO:
+    value: 0.35  # Minimum average confidence for a patch to remain valid
+
+  # ===== REFINEMENT =====
+  REFINEMENT_METHOD:
+    value: "feature_softargmax"  # "fft" | "feature_softargmax"
+  REFINEMENT_AREA:
+    value: 4  # Search area (px) around coarse match for sub-pixel refinement
+  RESAMPLED_PATCH_SIZE:
+    value: 16  # Patch size after bilinear resampling (matches DINOv2 patch_size=16)
+  FINE_REFINEMENT_DIM:
+    value: 64  # Channel dimension of the local refinement feature head
+  FINE_FEATURE_STRIDE:
+    value: 4  # Pixel stride of the local refinement feature map
+  FINE_REFINEMENT_WINDOW_RADIUS:
+    value: 2  # Search radius (fine-feature cells) around each coarse match
+  FINE_REFINEMENT_TEMPERATURE:
+    value: 0.1  # Softmax temperature for local feature correlation
+  FINE_REFINEMENT_CONTEXT_LAYER:
+    value: "auto"  # DINO layer index used as refinement context ("auto" selects best)
+
+  # ===== TRACKING =====
+  TRACKING_MODE:
+    value: False
+  TRACKING_HEAD:
+    value: False
+  TRACKING_WINDOW_SIZE:
+    value: 8  # Consecutive frames per tracking window
+  TRACKING_NUM_QUERY_POINTS:
+    value: 64  # Max query points sampled per tracking window
+  TRACKING_SEQUENCE_LENGTH:
+    value: 8  # Sequence length for temporal refinement module
+  TEMPORAL_REFINEMENT_HIDDEN_DIM:
+    value: 128  # Hidden dimension of the temporal mixer
+  TEMPORAL_REFINEMENT_NUM_BLOCKS:
+    value: 4  # TemporalMixerBlocks per refinement iteration
+  TEMPORAL_REFINEMENT_NUM_ITERS:
+    value: 4  # Forward-backward refinement iterations (weight-shared)
+  TEMPORAL_REFINEMENT_CORR_RADIUS:
+    value: 3  # Local correlation window radius (side = 2r+1)
+  TEMPORAL_REFINEMENT_KERNEL_SIZE:
+    value: 5  # Temporal convolution kernel size
+
+  # ===== LOSSES =====
+  INFONCE_TEMPERATURE:
+    value: 0.07  # Temperature for masked InfoNCE loss
+  INFONCE_SYMMETRIC:
+    value: True  # Use both source->target and target->source InfoNCE
+  FINE_REFINEMENT_LOSS_WEIGHT:
+    value: 0.25  # Weight of the fine correspondence regression loss
+  FINE_REFINEMENT_LOSS_BETA:
+    value: 1.0  # Smooth-L1 beta for fine correspondence regression
+  LOSS_WEIGHT:
+    value: {
+      Fundamental: 0.8
+    }
+  TRACKING_LOSS_WEIGHT:
+    value: 0.0  # Master weight for tracking losses (0 = disabled at test time)
+  TRACKING_CYCLE_LOSS_WEIGHT:
+    value: 1.0  # Sub-weight: cycle consistency loss
+  TRACKING_DESC_SIM_LOSS_WEIGHT:
+    value: 0.5  # Sub-weight: descriptor similarity at tracked points
+  TRACKING_REG_LOSS_WEIGHT:
+    value: 0.1  # Sub-weight: coarse-to-fine regularization
+  TRACKING_REG_MARGIN:
+    value: 32.0  # Max expected fine refinement delta (px) before penalty
+  TRACKING_POSITION_LOSS_WEIGHT:
+    value: 1.0  # Weight for Huber position regression loss
+  TRACKING_VISIBILITY_LOSS_WEIGHT:
+    value: 0.5  # Weight for BCE visibility classification loss
+
+  # ===== OPTIMIZATION =====
+  OPTIMIZER:
+    value: "Adam"  # Optimizer algorithm
+  LEARNING_RATE:
+    value: 1.0e-4  # Base learning rate
+  WEIGHT_DECAY:
+    value: 0.0  # L2 weight decay coefficient
+  GRADIENT_ACCUMULATION_STEPS:
+    value: 2  # Accumulate gradients over N mini-batches before stepping
+  EPOCHS:
+    value: 200  # Maximum training epochs
+  WARMUP_STEPS:
+    value: 200  # Linear warmup steps at start of training
+  EARLYSTOPPING_PATIENCE:
+    value: 50  # Epochs without improvement before stopping
+  LR_SCHEDULER:
+    value: "stepwise"  # "stepwise" | "cosine" | "plateau" | "exponential"
+  STEPWISESCHEDULER_NSTEPS:
+    value: 3  # Number of decay steps (stepwise)
+  STEPWISESCHEDULER_GAMMA:
+    value: 0.5  # Multiplicative decay factor per step (stepwise)
+  COSINESCHEDULER_NPERIODS:
+    value: 4  # Number of cosine annealing periods
+  ONPLATEAUSCHEDULER_PATIENCE:
+    value: 25  # Epochs to wait before reducing LR (plateau)
+  ONPLATEAUSCHEDULER_FACTOR:
+    value: 1.0e-1  # LR reduction factor on plateau
+  EXPONENTIALSCHEDULER_GAMMA:
+    value: 1.04  # Per-epoch multiplicative factor (exponential)
+
+  # ===== GEOMETRY =====
+  GEOMETRY_MODEL_NAME:
+    value: "Ruicheng/moge-2-vits-normal"  # Monocular depth estimation model
+  DEPTH_SCALE_FACTOR:
+    value: 60  # Scale factor applied to predicted depth maps
+  DEPTH_BIAS_FACTOR:
+    value: 30  # Additive bias applied to predicted depth maps
+
+  # ===== LOGGING =====
+  NO_WANDB:
+    value: False  # Set True to disable Weights & Biases logging entirely
+  LOG_FREQ_WANDB:
+    value: 10  # Log metrics to W&B every N steps
+  MODEL_WATCHER_FREQ_WANDB:
+    value: 5  # Log watched model parameters every N epochs

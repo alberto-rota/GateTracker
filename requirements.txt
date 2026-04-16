@@ -1,0 +1,43 @@
+# GateTracker dependencies
+
+# Core ML
+torch==2.4.1
+torchvision==0.19.1
+transformers==5.5.0
+
+# Configuration and logging
+dotmap==1.3.30
+PyYAML==6.0.1
+rich==13.8.1
+wandb==0.18.1
+
+# Computer vision
+opencv-python==4.11.0.86
+scikit-image==0.25.2
+pillow==10.4.0
+
+# Scientific computing
+numpy==2.2.2
+scipy==1.14.1
+scikit-learn==1.6.1
+pandas==2.2.2
+matplotlib==3.8.4
+seaborn==0.13.2
+
+# Geometry / depth
+moge @ git+https://github.com/microsoft/MoGe.git
+
+# Data and I/O
+natsort==8.4.0
+imageio==2.37.0
+tqdm==4.65.0
+google-cloud-storage==3.1.1
+
+# Development and debugging
+pytest==8.3.2
+lovely-tensors==0.1.15
+torchinfo==1.8.0
+psutil==6.1.1
+
+# Visualization (optional)
+rerun-sdk==0.27.2

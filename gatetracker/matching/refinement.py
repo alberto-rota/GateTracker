@@ -1,0 +1,217 @@
+import torch
+import torch.nn.functional as F
+
+
+def FFT_patch_refiner(
+    spatches: torch.Tensor,
+    tpatches: torch.Tensor,
+    patch_size: int = 16,
+    confidence_threshold: float = None,
+):
+    """
+    Refines patch correspondences using phase correlation with torch tensors on GPU.
+    Incorporates original matching scores and produces refined scores based on correlation confidence.
+
+    Inputs:
+      spatches: Source patches tensor of shape (N, C, patch_size, patch_size)
+      tpatches: Target patches tensor of shape (N, C, patch_size, patch_size)
+      confidence_threshold: Minimum correlation value to consider a refinement valid
+      patch_size: The size of each square patch
+
+    Outputs:
+      best_src_xy: Tensor of refined source patch centers (N, 2)
+      best_tgt_xy: Tensor of corresponding target patch centers (N, 2)
+      refined_scores: Tensor of refined confidence scores (N,)
+    """
+    N = spatches.shape[0]
+    eps = 1e-8
+
+    F1 = torch.fft.fft2(spatches, dim=(-2, -1))
+    F2 = torch.fft.fft2(tpatches, dim=(-2, -1))
+
+    cross_power = (F2 * torch.conj(F1)).sum(dim=1, keepdim=True)
+    cross_power_normalized = cross_power / (torch.abs(cross_power) + eps)
+
+    corr = torch.fft.ifft2(cross_power_normalized, dim=(-2, -1))
+    corr_abs = torch.abs(corr).squeeze(1)  # Shape: (N, patch_size, patch_size)
+
+    best_values, best_indices = corr_abs.view(N, -1).max(dim=1)  # Shapes: (N,), (N,)
+
+    peak_y = best_indices // patch_size
+    peak_x = best_indices % patch_size
+
+    offset_x = torch.where(peak_x > (patch_size // 2), peak_x - patch_size, peak_x)
+    offset_y = torch.where(peak_y > (patch_size // 2), peak_y - patch_size, peak_y)
+    offsets = torch.stack((offset_x, offset_y), dim=1).float()  # shape: (N, 2)
+
+    center = (patch_size - 1) / 2.0
+    best_src_xy = torch.tensor([center, center], device=spatches.device).repeat(N, 1)
+    best_tgt_xy = best_src_xy + offsets
+
+    normalized_corr = best_values.clamp(0, 1)
+
+    if confidence_threshold is not None:
+        keep_mask = normalized_corr >= float(confidence_threshold)
+        best_tgt_xy = torch.where(keep_mask.unsqueeze(1), best_tgt_xy, best_src_xy)
+        normalized_corr = torch.where(
+            keep_mask, normalized_corr, torch.zeros_like(normalized_corr)
+        )
+
+    return best_src_xy, best_tgt_xy, normalized_corr
+
+
+def feature_refinement_patch_size(window_radius: int, feature_stride: int) -> int:
+    """
+    Returns the virtual patch size used by `apply_refinement_offsets`.
+
+    Args:
+        window_radius: Search radius in fine-feature coordinates.
+        feature_stride: Pixel stride between image and fine feature map.
+    """
+    return 2 * int(window_radius) * int(feature_stride) + 1
+
+
+def _pixels_to_feature_coords(points: torch.Tensor, feature_stride: int) -> torch.Tensor:
+    """
+    Maps image-space pixel centers to fine-feature coordinates.
+
+    Args:
+        points: [M, 2] pixel coordinates in `(x, y)` order.
+        feature_stride: Pixel stride of the fine feature map.
+
+    Returns:
+        [M, 2] coordinates in feature-map index space.
+    """
+    return (points + 0.5) / float(feature_stride) - 0.5
+
+
+def _coords_to_grid(coords: torch.Tensor, height: int, width: int) -> torch.Tensor:
+    """
+    Converts feature coordinates to `grid_sample` coordinates.
+
+    Args:
+        coords: [..., 2] feature coordinates in `(x, y)` order.
+        height: Feature-map height.
+        width: Feature-map width.
+
+    Returns:
+        [..., 2] normalized coordinates in `[-1, 1]`.
+    """
+    grid = coords.clone()
+    grid[..., 0] = (grid[..., 0] / max(width - 1, 1)) * 2 - 1
+    grid[..., 1] = (grid[..., 1] / max(height - 1, 1)) * 2 - 1
+    return grid
+
+
+def feature_softargmax_refiner(
+    source_feature_map: torch.Tensor,
+    target_feature_map: torch.Tensor,
+    source_pixels: torch.Tensor,
+    target_pixels: torch.Tensor,
+    batch_indices: torch.Tensor,
+    window_radius: int = 2,
+    feature_stride: int = 4,
+    softmax_temperature: float = 0.1,
+    confidence_threshold: float = None,
+):
+    """
+    Refines coarse correspondences in feature space with local correlation.
+
+    Args:
+        source_feature_map: [B, C_f, H_f, W_f] fine source features.
+        target_feature_map: [B, C_f, H_f, W_f] fine target features.
+        source_pixels: [M, 2] coarse source pixels in `(x, y)`.
+        target_pixels: [M, 2] coarse target pixels in `(x, y)`.
+        batch_indices: [M] batch index of each correspondence.
+        window_radius: Local search radius in fine-feature cells.
+        feature_stride: Pixel stride between image and fine feature map.
+        softmax_temperature: Correlation temperature for soft-argmax.
+        confidence_threshold: Optional threshold for gating low-confidence shifts.
+
+    Returns:
+        best_src_xy: [M, 2] source coordinates inside the virtual refinement patch.
+        best_tgt_xy: [M, 2] target coordinates inside the virtual refinement patch.
+        refinement_scores: [M] confidence scores in `[0, 1]`.
+    """
+    device = source_feature_map.device
+    dtype = source_feature_map.dtype
+    match_count = source_pixels.shape[0]
+    patch_size = feature_refinement_patch_size(window_radius, feature_stride)
+    patch_center = patch_size / 2.0 - 0.5
+    best_src_xy = torch.full((match_count, 2), patch_center, device=device, dtype=dtype)
+    if match_count == 0:
+        return best_src_xy, best_src_xy.clone(), torch.zeros(0, device=device, dtype=dtype)
+
+    _, _, feature_height, feature_width = source_feature_map.shape
+    source_maps = source_feature_map[batch_indices]  # [M, C_f, H_f, W_f]
+    target_maps = target_feature_map[batch_indices]  # [M, C_f, H_f, W_f]
+
+    source_feature_coords = _pixels_to_feature_coords(source_pixels.float(), feature_stride)
+    target_feature_coords = _pixels_to_feature_coords(target_pixels.float(), feature_stride)
+
+    source_grid = _coords_to_grid(
+        source_feature_coords.view(match_count, 1, 1, 2),
+        feature_height,
+        feature_width,
+    )  # [M, 1, 1, 2]
+    source_queries = F.grid_sample(
+        source_maps,
+        source_grid,
+        mode="bilinear",
+        align_corners=True,
+    ).squeeze(-1).squeeze(-1)  # [M, C_f]
+    source_queries = F.normalize(source_queries, dim=1)
+
+    offsets = torch.arange(
+        -window_radius, window_radius + 1, device=device, dtype=dtype
+    )  # [W_w]
+    offset_y, offset_x = torch.meshgrid(offsets, offsets, indexing="ij")
+    offset_grid = torch.stack((offset_x, offset_y), dim=-1)  # [W_w, W_w, 2]
+    target_window_coords = (
+        target_feature_coords.view(match_count, 1, 1, 2) + offset_grid.unsqueeze(0)
+    )  # [M, W_w, W_w, 2]
+    target_grid = _coords_to_grid(target_window_coords, feature_height, feature_width)
+    target_windows = F.grid_sample(
+        target_maps,
+        target_grid,
+        mode="bilinear",
+        align_corners=True,
+    )  # [M, C_f, W_w, W_w]
+    target_windows = F.normalize(target_windows, dim=1)
+
+    logits = torch.einsum(
+        "mc,mcij->mij",
+        source_queries,
+        target_windows,
+    )  # [M, W_w, W_w]
+    logits = logits.view(match_count, -1) / max(float(softmax_temperature), 1e-6)
+    probabilities = torch.softmax(logits, dim=1)  # [M, W_w * W_w]
+    window_width = 2 * window_radius + 1
+    probabilities_2d = probabilities.view(match_count, window_width, window_width)
+
+    offset_grid_pixels = offset_grid.view(1, window_width, window_width, 2) * float(
+        feature_stride
+    )  # [1, W_w, W_w, 2]
+    expected_offsets = (
+        probabilities_2d.unsqueeze(-1) * offset_grid_pixels
+    ).sum(dim=(1, 2))  # [M, 2]
+    best_tgt_xy = best_src_xy + expected_offsets
+
+    peak_probability = probabilities.max(dim=1).values  # [M]
+    entropy = -(probabilities * torch.log(probabilities + 1e-8)).sum(dim=1)  # [M]
+    max_entropy = torch.log(
+        torch.tensor(float(probabilities.shape[1]), device=device, dtype=dtype)
+    ).clamp_min(1e-6)
+    entropy_confidence = (1.0 - entropy / max_entropy).clamp(0.0, 1.0)
+    refinement_scores = (0.5 * peak_probability + 0.5 * entropy_confidence).clamp(
+        0.0, 1.0
+    )  # [M]
+
+    if confidence_threshold is not None:
+        keep_mask = refinement_scores >= float(confidence_threshold)
+        best_tgt_xy = torch.where(keep_mask.unsqueeze(1), best_tgt_xy, best_src_xy)
+        refinement_scores = torch.where(
+            keep_mask, refinement_scores, torch.zeros_like(refinement_scores)
+        )
+
+    return best_src_xy, best_tgt_xy, refinement_scores

@@ -1,0 +1,212 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites><testsuite name="pytest" errors="2" failures="2" skipped="0" tests="12" time="33.252" timestamp="2024-09-15T18:10:38.794206+02:00" hostname="rk018445"><testcase classname="tests.test_depthmodel" name="test_forward" time="4.832" /><testcase classname="tests.test_depthmodel" name="test_output_values" time="2.775" /><testcase classname="tests.test_depthmodel" name="test_backward" time="2.883"><failure message="RuntimeError: Expected all tensors to be on the same device, but found at least two devices, cuda:0 and cpu!">model = Depth_E2E(
+  (backbone): DINOv2_Intel(
+    (model): DPTModel(
+      (embeddings): DPTViTEmbeddings(
+        (patch_emb...U()
+          (4): Conv2d(32, 1, kernel_size=(1, 1), stride=(1, 1))
+          (5): ReLU()
+        )
+      )
+    )
+  )
+)
+framestack = tensor([[[[[0.9211, 0.0862, 0.6876,  ..., 0.1982, 0.8720, 0.4109],
+           [0.3194, 0.2369, 0.3016,  ..., 0.9666, 0..., 0.9262, 0.6721,  ..., 0.3437, 0.2770, 0.4175],
+           [0.0786, 0.5623, 0.9749,  ..., 0.6252, 0.4163, 0.4224]]]]])
+loss_fn = DepthLoss()
+depthmap = tensor([[[[13.3823, 13.3802, 13.3803,  ..., 15.4073, 15.4771, 15.2849],
+          [13.4051, 13.4058, 13.4161,  ..., 15...      [20.9445, 21.0599, 21.1190,  ..., 23.1856, 23.2035, 23.1473]]]],
+       device='cuda:0', grad_fn=&lt;ViewBackward0&gt;)
+
+    @pytest.mark.filterwarnings("ignore::FutureWarning")
+    def test_backward(model, framestack, loss_fn, depthmap):
+        # Create a dummy loss tensor
+        warped = framestack[:, -1] + torch.randn_like(framestack[:, -1])
+&gt;       losstens = loss_fn(framestack[:, -1], warped, depthmap[:, 0])
+
+tests/test_depthmodel.py:69: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+../.conda/envs/MONO3D/lib/python3.10/site-packages/torch/nn/modules/module.py:1553: in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+../.conda/envs/MONO3D/lib/python3.10/site-packages/torch/nn/modules/module.py:1562: in _call_impl
+    return forward_call(*args, **kwargs)
+losses.py:662: in forward
+    torch.stack([loss(target, warped, depthmap) for loss in self.losses]).to(
+losses.py:662: in &lt;listcomp&gt;
+    torch.stack([loss(target, warped, depthmap) for loss in self.losses]).to(
+../.conda/envs/MONO3D/lib/python3.10/site-packages/torch/nn/modules/module.py:1553: in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+../.conda/envs/MONO3D/lib/python3.10/site-packages/torch/nn/modules/module.py:1562: in _call_impl
+    return forward_call(*args, **kwargs)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = EASLoss()
+target = tensor([[[[0.0000, 0.0000, 0.0000,  ..., 0.6404, 0.3193, 0.3329],
+          [0.0000, 0.0000, 0.0000,  ..., 0.7872, 0.7...49, 0.9262, 0.6721,  ..., 0.0000, 0.2770, 0.4175],
+          [0.0786, 0.5623, 0.9749,  ..., 0.0000, 0.4163, 0.4224]]]])
+warped = tensor([[[[ 0.0000e+00,  0.0000e+00,  0.0000e+00,  ...,  2.4141e+00,
+            5.9516e-01,  5.2302e-01],
+          [...273e-01],
+          [ 1.2119e+00,  6.8151e-02,  2.2953e-01,  ...,  0.0000e+00,
+           -8.4609e-01, -3.6357e-01]]]])
+depthmap = tensor([[[13.3823, 13.3802, 13.3803,  ..., 15.4073, 15.4771, 15.2849],
+         [13.4051, 13.4058, 13.4161,  ..., 15.4...     [20.9445, 21.0599, 21.1190,  ..., 23.1856, 23.2035, 23.1473]]],
+       device='cuda:0', grad_fn=&lt;SelectBackward0&gt;)
+
+    def forward(
+        self, target: torch.Tensor, warped: torch.Tensor, depthmap: torch.Tensor
+    ) -&gt; torch.Tensor:
+        """Compute the EAS loss.
+    
+        Args:
+            target (torch.Tensor): Target image.
+            warped (torch.Tensor): Warped image.
+            depthmap (torch.Tensor): Depth map.
+    
+        Returns:
+            torch.Tensor: EAS loss.
+        """
+        # Calculate horizontal and vertical gradients of the inverse_depth map
+        inverse_depth_gradients_x = torch.abs(depthmap[:, :, :-1] - depthmap[:, :, 1:])
+        inverse_depth_gradients_y = torch.abs(depthmap[:, :-1, :] - depthmap[:, 1:, :])
+    
+        # Calculate horizontal and vertical gradients of the image
+        image_gradients_x = torch.mean(
+            torch.abs(warped[:, :, :, :-1] - warped[:, :, :, 1:]), dim=1
+        )  # Resulting shape: Bx1x448x447
+        image_gradients_y = torch.mean(
+            torch.abs(warped[:, :, :-1, :] - warped[:, :, 1:, :]), dim=1
+        )  # Resulting shape: Bx1x447x448
+        # Adjust inverse_depth gradients to match the shape of image gradients
+        inverse_depth_gradients_x = inverse_depth_gradients_x[:, :-1, :]  # Shape: Bx447x447
+        inverse_depth_gradients_y = inverse_depth_gradients_y[:, :, :-1]  # Shape: Bx447x447
+    
+        # Match the dimensions for smoothness loss calculation
+        image_gradients_x = image_gradients_x[:, :-1, :]  # Shape: Bx1x447x447
+        image_gradients_y = image_gradients_y[:, :, :-1]  # Shape: Bx1x447x447
+    
+        # Calculate the smoothness loss
+&gt;       smoothness_loss = inverse_depth_gradients_x * torch.exp(
+            -image_gradients_x
+        ) + inverse_depth_gradients_y * torch.exp(-image_gradients_y)
+E       RuntimeError: Expected all tensors to be on the same device, but found at least two devices, cuda:0 and cpu!
+
+losses.py:614: RuntimeError</failure></testcase><testcase classname="tests.test_depthmodel" name="test_amp_support" time="2.603"><error message="failed on setup with &quot;file /home/alberto/MONO3D/tests/test_depthmodel.py, line 80&#10;  @pytest.mark.skipif(not torch.cuda.is_available(), reason=&quot;CUDA is not available&quot;)&#10;  def test_amp_support(model, framestack, loss_fn, odometry):&#10;E       fixture 'odometry' not found&#10;&gt;       available fixtures: anyio_backend, anyio_backend_name, anyio_backend_options, benchmark, benchmark_weave, cache, capfd, capfdbinary, caplog, capsys, capsysbinary, depthmap, doctest_namespace, framestack, loss_fn, model, monkeypatch, pytestconfig, record_property, record_testsuite_property, record_xml_attribute, recwarn, tmp_path, tmp_path_factory, tmpdir, tmpdir_factory&#10;&gt;       use 'pytest --fixtures [testpath]' for help on them.&#10;&#10;/home/alberto/MONO3D/tests/test_depthmodel.py:80&quot;">file /home/alberto/MONO3D/tests/test_depthmodel.py, line 80
+  @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+  def test_amp_support(model, framestack, loss_fn, odometry):
+E       fixture 'odometry' not found
+&gt;       available fixtures: anyio_backend, anyio_backend_name, anyio_backend_options, benchmark, benchmark_weave, cache, capfd, capfdbinary, caplog, capsys, capsysbinary, depthmap, doctest_namespace, framestack, loss_fn, model, monkeypatch, pytestconfig, record_property, record_testsuite_property, record_xml_attribute, recwarn, tmp_path, tmp_path_factory, tmpdir, tmpdir_factory
+&gt;       use 'pytest --fixtures [testpath]' for help on them.
+
+/home/alberto/MONO3D/tests/test_depthmodel.py:80</error></testcase><testcase classname="tests.test_mono3dmodel" name="test_forward" time="3.206" /><testcase classname="tests.test_mono3dmodel" name="test_output_values" time="3.079" /><testcase classname="tests.test_mono3dmodel" name="test_backward" time="2.913"><failure message="RuntimeError: Expected all tensors to be on the same device, but found at least two devices, cuda:0 and cpu!">model = MONO3D_E2E(
+  (odometry_feature_highlighter): Sequential(
+    (0): Conv2d(6, 12, kernel_size=(3, 3), stride=(1, 1), pa...ize=(1, 1), stride=(1, 1))
+          (5): ReLU()
+        )
+      )
+    )
+  )
+  (truedepth): TrueDepthTransformation()
+)
+framestack = tensor([[[[[0.4490, 0.6953, 0.8959,  ..., 0.7788, 0.8866, 0.6426],
+           [0.7380, 0.2557, 0.5359,  ..., 0.5987, 0..., 0.4473, 0.4503,  ..., 0.2721, 0.3455, 0.5204],
+           [0.9558, 0.3460, 0.6520,  ..., 0.7521, 0.8826, 0.1304]]]]])
+loss_fn = MONO3D_Loss(
+  (odometry_loss): OdomLoss(
+    (pos_loss): MSE()
+    (rot_loss): MSE()
+  )
+  (depth_loss): DepthLoss()
+)
+modelout = (tensor([[[[0.0046, 0.0046, 0.0046,  ..., 0.0033, 0.0033, 0.0033],
+          [0.0046, 0.0046, 0.0046,  ..., 0.0033, 0....44],
+        [ 0.0973,  0.0042,  0.0174, -0.0432,  0.0365,  0.0640]],
+       device='cuda:0', grad_fn=&lt;ViewBackward0&gt;))
+
+    @pytest.mark.filterwarnings("ignore::FutureWarning")
+    def test_backward(model, framestack, loss_fn, modelout):
+        # Create a dummy loss tensor
+        warped = framestack[:, -1] + torch.randn_like(framestack[:, -1])
+        tr = modelout[1] + torch.randn_like(modelout[1])
+&gt;       losstens = loss_fn(framestack[:, -1], warped, modelout[0][:, 0], tr, modelout[1])
+
+tests/test_mono3dmodel.py:84: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+../.conda/envs/MONO3D/lib/python3.10/site-packages/torch/nn/modules/module.py:1553: in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+../.conda/envs/MONO3D/lib/python3.10/site-packages/torch/nn/modules/module.py:1562: in _call_impl
+    return forward_call(*args, **kwargs)
+losses.py:859: in forward
+    ) * self.alpha + self.depth_loss(target, warped, depthmap) * ((1 - self.alpha))
+../.conda/envs/MONO3D/lib/python3.10/site-packages/torch/nn/modules/module.py:1553: in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+../.conda/envs/MONO3D/lib/python3.10/site-packages/torch/nn/modules/module.py:1562: in _call_impl
+    return forward_call(*args, **kwargs)
+losses.py:662: in forward
+    torch.stack([loss(target, warped, depthmap) for loss in self.losses]).to(
+losses.py:662: in &lt;listcomp&gt;
+    torch.stack([loss(target, warped, depthmap) for loss in self.losses]).to(
+../.conda/envs/MONO3D/lib/python3.10/site-packages/torch/nn/modules/module.py:1553: in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+../.conda/envs/MONO3D/lib/python3.10/site-packages/torch/nn/modules/module.py:1562: in _call_impl
+    return forward_call(*args, **kwargs)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = EASLoss()
+target = tensor([[[[0.5631, 0.0273, 0.0960,  ..., 0.2539, 0.1921, 0.2304],
+          [0.1022, 0.1566, 0.0145,  ..., 0.9557, 0.1...17, 0.4473, 0.4503,  ..., 0.2721, 0.3455, 0.5204],
+          [0.9558, 0.3460, 0.6520,  ..., 0.7521, 0.8826, 0.1304]]]])
+warped = tensor([[[[-0.2607,  1.0319, -0.5453,  ..., -1.3183,  0.3567,  0.2071],
+          [ 2.0529, -0.4055, -0.0089,  ...,  0..., -1.1273,  ..., -0.2017,  0.6820, -0.3540],
+          [ 1.3171,  1.5431,  1.0955,  ...,  1.4311,  0.4889, -0.1120]]]])
+depthmap = tensor([[[0.0046, 0.0046, 0.0046,  ..., 0.0033, 0.0033, 0.0033],
+         [0.0046, 0.0046, 0.0046,  ..., 0.0033, 0.003...,
+         [0.0027, 0.0027, 0.0027,  ..., 0.0023, 0.0023, 0.0023]]],
+       device='cuda:0', grad_fn=&lt;SelectBackward0&gt;)
+
+    def forward(
+        self, target: torch.Tensor, warped: torch.Tensor, depthmap: torch.Tensor
+    ) -&gt; torch.Tensor:
+        """Compute the EAS loss.
+    
+        Args:
+            target (torch.Tensor): Target image.
+            warped (torch.Tensor): Warped image.
+            depthmap (torch.Tensor): Depth map.
+    
+        Returns:
+            torch.Tensor: EAS loss.
+        """
+        # Calculate horizontal and vertical gradients of the inverse_depth map
+        inverse_depth_gradients_x = torch.abs(depthmap[:, :, :-1] - depthmap[:, :, 1:])
+        inverse_depth_gradients_y = torch.abs(depthmap[:, :-1, :] - depthmap[:, 1:, :])
+    
+        # Calculate horizontal and vertical gradients of the image
+        image_gradients_x = torch.mean(
+            torch.abs(warped[:, :, :, :-1] - warped[:, :, :, 1:]), dim=1
+        )  # Resulting shape: Bx1x448x447
+        image_gradients_y = torch.mean(
+            torch.abs(warped[:, :, :-1, :] - warped[:, :, 1:, :]), dim=1
+        )  # Resulting shape: Bx1x447x448
+        # Adjust inverse_depth gradients to match the shape of image gradients
+        inverse_depth_gradients_x = inverse_depth_gradients_x[:, :-1, :]  # Shape: Bx447x447
+        inverse_depth_gradients_y = inverse_depth_gradients_y[:, :, :-1]  # Shape: Bx447x447
+    
+        # Match the dimensions for smoothness loss calculation
+        image_gradients_x = image_gradients_x[:, :-1, :]  # Shape: Bx1x447x447
+        image_gradients_y = image_gradients_y[:, :, :-1]  # Shape: Bx1x447x447
+    
+        # Calculate the smoothness loss
+&gt;       smoothness_loss = inverse_depth_gradients_x * torch.exp(
+            -image_gradients_x
+        ) + inverse_depth_gradients_y * torch.exp(-image_gradients_y)
+E       RuntimeError: Expected all tensors to be on the same device, but found at least two devices, cuda:0 and cpu!
+
+losses.py:614: RuntimeError</failure></testcase><testcase classname="tests.test_mono3dmodel" name="test_amp_support" time="2.488"><error message="failed on setup with &quot;file /home/alberto/MONO3D/tests/test_mono3dmodel.py, line 95&#10;  @pytest.mark.skipif(not torch.cuda.is_available(), reason=&quot;CUDA is not available&quot;)&#10;  def test_amp_support(model, framestack, loss_fn, odometry):&#10;E       fixture 'odometry' not found&#10;&gt;       available fixtures: anyio_backend, anyio_backend_name, anyio_backend_options, benchmark, benchmark_weave, cache, capfd, capfdbinary, caplog, capsys, capsysbinary, doctest_namespace, framestack, loss_fn, model, modelout, monkeypatch, pytestconfig, record_property, record_testsuite_property, record_xml_attribute, recwarn, tmp_path, tmp_path_factory, tmpdir, tmpdir_factory&#10;&gt;       use 'pytest --fixtures [testpath]' for help on them.&#10;&#10;/home/alberto/MONO3D/tests/test_mono3dmodel.py:95&quot;">file /home/alberto/MONO3D/tests/test_mono3dmodel.py, line 95
+  @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+  def test_amp_support(model, framestack, loss_fn, odometry):
+E       fixture 'odometry' not found
+&gt;       available fixtures: anyio_backend, anyio_backend_name, anyio_backend_options, benchmark, benchmark_weave, cache, capfd, capfdbinary, caplog, capsys, capsysbinary, doctest_namespace, framestack, loss_fn, model, modelout, monkeypatch, pytestconfig, record_property, record_testsuite_property, record_xml_attribute, recwarn, tmp_path, tmp_path_factory, tmpdir, tmpdir_factory
+&gt;       use 'pytest --fixtures [testpath]' for help on them.
+
+/home/alberto/MONO3D/tests/test_mono3dmodel.py:95</error></testcase><testcase classname="tests.test_odommodel" name="test_forward" time="1.078" /><testcase classname="tests.test_odommodel" name="test_output_values" time="1.335" /><testcase classname="tests.test_odommodel" name="test_backward" time="1.174" /><testcase classname="tests.test_odommodel" name="test_amp_support" time="1.324" /></testsuite></testsuites>

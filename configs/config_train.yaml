@@ -1,0 +1,226 @@
+parameters:
+
+  # ===== PROJECT =====
+  PROJECT:
+    value: "GateTracker"
+  WANDB_ENTITY:
+    value: ""
+  RUN:
+    value: ""
+  NOTES:
+    value: ""
+
+  # ===== PHASE =====
+  # pretrain: descriptor / fusion / refinement (pairwise matching); no tracking losses
+  PHASE:
+    value: "tracking"
+  FROM_PRETRAINED_CHECKPOINT:
+    value: ""
+  PRETRAINED_DESCRIPTOR_CKPT:
+    value: "feasible-glitter-797"
+
+  # ===== DATA =====
+  IMAGE_HEIGHT:
+    value: 448
+  IMAGE_WIDTH:
+    value: 448
+  BATCH_SIZE:
+    value: 8
+  SHUFFLE:
+    value: True
+  WORKERS:
+    value: 1
+  PIN_MEMORY:
+    value: True
+  PREFETCH_FACTOR:
+    value: 1
+  FEWFRAMES:
+    value: False
+  RANDOM_POSE_RANGES_OVERRIDE:
+    value: [2.5, 3.25]
+  DATASETS:
+    value:
+      SCARED:
+        PATH: "/home/shared/nearmrs/arota/SCARED"
+        FPS: 32
+        FRAMESKIP: [1, 2, 4, 8, 16, 24, 32]
+        TRAIN_VIDEOS: ["train_v*"]
+        VAL_VIDEOS: ["test_*"]
+        TEST_VIDEOS: ["test_*"]
+        RANDOM_POSE_TRAINING: True
+        RANDOM_POSE_RANGES: [2.5, 3.25]
+        CURRICULUM_FACTOR: 1
+        AUGMENTATION_PROBABILITY: {
+          COLOR: 0.8,
+          GEOMETRIC: 0.0,
+          REVERSE: 0.0,
+          STANDSTILL: 0.0
+        }
+        CROP_ZOOM_FACTOR: 1.0
+
+      CHOLEC80:
+        PATH: "/home/shared/nearmrs/arota/CHOLEC80/videos"
+        FPS: 80
+        FRAMESKIP: [1]
+        TRAIN_VIDEOS: ["train_video02"]
+        TEST_VIDEOS: ["test_video*"]
+        VAL_VIDEOS: ["test_video*"]
+        RANDOM_POSE_TRAINING: True
+        RANDOM_POSE_RANGES: [2.5, 3.25]
+        CURRICULUM_FACTOR: 1
+        AUGMENTATION_PROBABILITY: {
+          COLOR: 0.0,
+          GEOMETRIC: 0.0,
+          REVERSE: 0.0,
+          STANDSTILL: 0.0
+        }
+        CROP_ZOOM_FACTOR: 1.2
+
+      # STEREOMIS:
+      #   PATH: "StereoMIS_Tracking"
+      #   FPS: 4
+      #   FRAMESKIP: [1, 2]
+      #   TRAIN_VAL_SPLIT: 0.7
+      #   TRAIN_VIDEOS: ["train_*"]
+      #   VAL_VIDEOS: ["test_*"]
+      #   TEST_VIDEOS: ["test_*"]
+      #   RANDOM_POSE_TRAINING: True
+      #   RANDOM_POSE_RANGES: [2.5, 3.25]
+      #   CURRICULUM_FACTOR: 1
+      #   AUGMENTATION_PROBABILITY: {
+      #     COLOR: 0.8,
+      #     GEOMETRIC: 0.0,
+      #     REVERSE: 0.0,
+      #     STANDSTILL: 0.0
+      #   }
+      #   CROP_ZOOM_FACTOR: 1.2
+
+  # ===== BACKBONE =====
+  DINO_MODEL_NAME:
+    value: "facebook/dinov3-vitb16-pretrain-lvd1689m"
+  DINO_LAYERS:
+    value: "all"
+
+  # ===== FUSION =====
+  FUSION_HEAD:
+    value: "register_gated_hierarchical"
+  FUSION_GATE_TEMPERATURE:
+    value: 2.0
+  FUSION_UNIFORM_MIXING:
+    value: 0.10
+  FUSION_LAYER_DROPOUT:
+    value: 0.10
+  FUSION_GATE_LOGIT_BOUND:
+    value: 1.5
+
+  # ===== MATCHING =====
+  TRIPLETS_TO_MINE:
+    value: 128
+  PATCH_MATCHING_SCORE_THRESHOLD:
+    value: 0.975
+  PIXEL_MATCHING_SCORE_THRESHOLD:
+    value: 0.15
+  MIN_MATCHES_TO_COLLECT:
+    value: 256
+  MAX_MATCHES_TO_PROCESS:
+    value: 500
+  MAX_EPIPOLAR_DISTANCE:
+    value: 2
+  SCORE_WEIGHTS:
+    value: {
+      DESCRIPTOR: 0.2,
+      REFINEMENT: 0.3,
+      EPIPOLAR: 0.6
+    }
+  USE_CORRESPONDENCE_CONFIDENCE:
+    value: True
+  CONFIDENCE_PHOTOMETRIC_BETA:
+    value: 6.0
+  CONFIDENCE_PATCH_VALID_RATIO:
+    value: 0.35
+
+  # ===== REFINEMENT =====
+  REFINEMENT_METHOD:
+    value: "feature_softargmax"
+  REFINEMENT_AREA:
+    value: 4
+  RESAMPLED_PATCH_SIZE:
+    value: 16
+  FINE_REFINEMENT_DIM:
+    value: 64
+  FINE_FEATURE_STRIDE:
+    value: 4
+  FINE_REFINEMENT_WINDOW_RADIUS:
+    value: 2
+  FINE_REFINEMENT_TEMPERATURE:
+    value: 0.1
+  FINE_REFINEMENT_CONTEXT_LAYER:
+    value: "auto"
+
+  # ===== TRACKING FLAGS (pairwise head disabled in pretrain) =====
+  TRACKING_MODE:
+    value: False
+  TRACKING_HEAD:
+    value: False
+
+  # ===== LOSSES =====
+  DESCRIPTOR_LOSS:
+    value: "infonce"
+  INFONCE_TEMPERATURE:
+    value: 0.07
+  INFONCE_SYMMETRIC:
+    value: True
+  FINE_REFINEMENT_LOSS_WEIGHT:
+    value: 0.25
+  FINE_REFINEMENT_LOSS_BETA:
+    value: 1.0
+  LOSS_WEIGHT:
+    value: {
+      Fundamental: 0.8
+    }
+  LOSS_THRESHOLDS_WANDB:
+    value: {
+      Epipolar: 1
+    }
+
+  # ===== OPTIMIZATION =====
+  OPTIMIZER:
+    value: "Adam"
+  LEARNING_RATE:
+    value: 1.0e-5
+  LR_FUSION:
+    value: 1.0e-5
+  LR_FINE_FEATURE:
+    value: 1.0e-5
+  WEIGHT_DECAY:
+    value: 0.0
+  GRADIENT_ACCUMULATION_STEPS:
+    value: 2
+  EPOCHS:
+    value: 200
+  WARMUP_STEPS:
+    value: 0
+  EARLYSTOPPING_PATIENCE:
+    value: 50
+  LR_SCHEDULER:
+    value: "stepwise"
+  STEPWISESCHEDULER_NSTEPS:
+    value: 3
+  STEPWISESCHEDULER_GAMMA:
+    value: 0.5
+
+  # ===== GEOMETRY =====
+  GEOMETRY_MODEL_NAME:
+    value: "Ruicheng/moge-2-vits-normal"
+  DEPTH_SCALE_FACTOR:
+    value: 60
+  DEPTH_BIAS_FACTOR:
+    value: 30
+
+  # ===== LOGGING =====
+  NO_WANDB:
+    value: False
+  LOG_FREQ_WANDB:
+    value: 10
+  MODEL_WATCHER_FREQ_WANDB:
+    value: 5
