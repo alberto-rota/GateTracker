@@ -7,6 +7,10 @@ multi-frame temporal losses (for the TemporalRefinementNetwork).
 All losses are differentiable and do not require ground-truth tracks.
 """
 
+from __future__ import annotations
+
+from typing import Optional
+
 import torch
 import torch.nn.functional as F
 
@@ -17,6 +21,122 @@ from gatetracker.utils.tensor_ops import embedding2chw
 # ===================================================================
 # Shared helpers
 # ===================================================================
+
+def validity_at_tracks_bqt(
+    frame_valid_bt1hw: torch.Tensor,
+    tracks_bqt2: torch.Tensor,
+    height: int,
+    width: int,
+) -> torch.Tensor:
+    """Sample per-frame validity (holemask) at subpixel track locations.
+
+    Args:
+        frame_valid_bt1hw: [B, T, 1, H, W] values in [0, 1].
+        tracks_bqt2:       [B, Q, T, 2] pixel coords (x, y) = (u, v).
+        height, width:     Image size H, W.
+
+    Returns:
+        w_rgb: [B, Q, T] sampled validity in [0, 1].
+    """
+    B, T, _, H, W = frame_valid_bt1hw.shape
+    _, Q, Tt, _ = tracks_bqt2.shape
+    assert T == Tt, "frame_valid and tracks must agree on T"
+
+    fv = frame_valid_bt1hw.reshape(B * T, 1, H, W)
+    uv = tracks_bqt2.permute(0, 2, 1, 3).reshape(B * T, Q, 2)
+    gx = 2.0 * uv[..., 0].clamp(0.0, float(max(width - 1, 1))) / float(max(width - 1, 1)) - 1.0
+    gy = 2.0 * uv[..., 1].clamp(0.0, float(max(height - 1, 1))) / float(max(height - 1, 1)) - 1.0
+    grid = torch.stack([gx, gy], dim=-1).unsqueeze(2)  # [BT, Q, 1, 2]
+    sampled = F.grid_sample(
+        fv, grid, mode="bilinear", padding_mode="zeros", align_corners=True,
+    )  # [BT, 1, Q, 1]
+    w = sampled.squeeze(1).squeeze(-1).reshape(B, T, Q).permute(0, 2, 1)  # [B, Q, T]
+    return w.clamp(0.0, 1.0)
+
+
+def in_bounds_mask_bqt(tracks_bqt2: torch.Tensor, height: int, width: int) -> torch.Tensor:
+    """[B, Q, T] bool: track inside image."""
+    u, v = tracks_bqt2[..., 0], tracks_bqt2[..., 1]
+    return (
+        (u >= 0.0)
+        & (u < float(width))
+        & (v >= 0.0)
+        & (v < float(height))
+    )
+
+
+def composite_supervision_mask(
+    vis_gt_bqt: torch.Tensor,
+    w_rgb_bqt: torch.Tensor,
+    tracks_gt_bqt2: torch.Tensor,
+    height: int,
+    width: int,
+) -> torch.Tensor:
+    """M[b,q,t] = vis_gt & w_rgb & in_bounds (float 0/1)."""
+    if vis_gt_bqt.dtype == torch.bool:
+        vis = vis_gt_bqt
+    else:
+        vis = vis_gt_bqt > 0.5
+    ib = in_bounds_mask_bqt(tracks_gt_bqt2, height, width)
+    m = vis & (w_rgb_bqt > 0.5) & ib
+    return m.to(dtype=tracks_gt_bqt2.dtype)
+
+
+def temporal_supervised_losses(
+    tracks_pred: torch.Tensor,
+    visibility_pred: torch.Tensor,
+    tracks_gt: torch.Tensor,
+    composite_mask: torch.Tensor,
+    vis_target: torch.Tensor,
+    config,
+) -> dict:
+    """Masked Huber position + BCE visibility vs pseudo-GT.
+
+    Args:
+        tracks_pred:      [B, Q, T, 2]
+        visibility_pred:  [B, Q, T] logits
+        tracks_gt:        [B, Q, T, 2]
+        composite_mask:   [B, Q, T] bool/float — position supervision mask.
+        vis_target:       [B, Q, T] float in [0,1] for BCE (appearance-aware or strict).
+        config:           DotMap.
+
+    Returns:
+        dict with ``loss_sup_total``, ``loss_sup_pos``, ``loss_sup_vis``, ``metrics``.
+    """
+    huber_beta = float(config.get("TEMPORAL_SUP_HUBER_BETA", 1.0))
+    eps = 1e-6
+
+    mpos = composite_mask.to(dtype=tracks_pred.dtype)  # [B, Q, T]
+    diff = tracks_pred - tracks_gt
+    dist = diff.norm(dim=-1)  # [B, Q, T]
+    loss_h = F.smooth_l1_loss(
+        dist, torch.zeros_like(dist), beta=huber_beta, reduction="none",
+    )
+    loss_pos = (loss_h * mpos).sum() / (mpos.sum().clamp_min(eps))
+
+    vt = vis_target.to(dtype=tracks_pred.dtype).clamp(0.0, 1.0)
+    loss_vis = F.binary_cross_entropy_with_logits(
+        visibility_pred, vt, reduction="mean",
+    )
+
+    w_pos = float(config.get("TEMPORAL_SUP_POS_WEIGHT", 1.0))
+    w_vis = float(config.get("TEMPORAL_SUP_VIS_WEIGHT", 1.0))
+    loss_sup_total = w_pos * loss_pos + w_vis * loss_vis
+
+    frac_sup = float(mpos.mean().item())
+    metrics = {
+        "loss_sup_pos": loss_pos.item(),
+        "loss_sup_vis": loss_vis.item(),
+        "loss_sup_total": loss_sup_total.item(),
+        "sup_mask_fraction": frac_sup,
+    }
+    return {
+        "loss_sup_total": loss_sup_total,
+        "loss_sup_pos": loss_pos,
+        "loss_sup_vis": loss_vis,
+        "metrics": metrics,
+    }
+
 
 def _sample_query_grid(B: int, H: int, W: int, num_points: int, device: torch.device) -> torch.Tensor:
     """Sample a regular grid of query points covering the image, with jitter.
@@ -252,7 +372,8 @@ def temporal_cycle_consistency_loss(
     tracks: torch.Tensor,
     reverse_tracks: torch.Tensor,
     query_points: torch.Tensor,
-    visibility: torch.Tensor | None = None,
+    visibility: Optional[torch.Tensor] = None,
+    self_sup_mask_bqt: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Penalize round-trip error: track forward T frames, track backward, compare.
 
@@ -286,12 +407,17 @@ def temporal_cycle_consistency_loss(
         vis_prob = torch.sigmoid(visibility[:, :, 0])  # [B, Q]
         err = err * vis_prob.detach()
 
+    if self_sup_mask_bqt is not None:
+        wq = self_sup_mask_bqt.mean(dim=2).clamp(0.0, 1.0).detach()  # [B, Q]
+        err = err * wq
+
     return err.mean()
 
 
 def temporal_smoothness_loss(
     tracks: torch.Tensor,
-    visibility: torch.Tensor | None = None,
+    visibility: Optional[torch.Tensor] = None,
+    self_sup_mask_bqt: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""Second-order finite-difference penalty on track positions.
 
@@ -322,6 +448,13 @@ def temporal_smoothness_loss(
         weight = torch.min(torch.min(v0, v1), v2).detach()  # [B, Q, T-2]
         accel_norm = accel_norm * weight
 
+    if self_sup_mask_bqt is not None:
+        m0 = self_sup_mask_bqt[:, :, :-2]
+        m1 = self_sup_mask_bqt[:, :, 1:-1]
+        m2 = self_sup_mask_bqt[:, :, 2:]
+        wm = torch.minimum(torch.minimum(m0, m1), m2).detach()  # [B, Q, T-2]
+        accel_norm = accel_norm * wm
+
     return accel_norm.mean()
 
 
@@ -330,7 +463,8 @@ def temporal_descriptor_consistency_loss(
     query_points: torch.Tensor,
     descriptor_maps: list[torch.Tensor],
     patch_size: int,
-    visibility: torch.Tensor | None = None,
+    visibility: Optional[torch.Tensor] = None,
+    self_sup_mask_bqt: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Penalize descriptor drift: query descriptor should match target descriptor
     at tracked position across all T frames.
@@ -366,6 +500,12 @@ def temporal_descriptor_consistency_loss(
         vis_prob = torch.sigmoid(visibility).detach()
         cos_dist_stack = cos_dist_stack * vis_prob
 
+    if self_sup_mask_bqt is not None:
+        m0 = self_sup_mask_bqt[:, :, :1].expand_as(cos_dist_stack)
+        cos_dist_stack = cos_dist_stack * torch.minimum(
+            m0, self_sup_mask_bqt.detach(),
+        )
+
     return cos_dist_stack.mean()
 
 
@@ -374,7 +514,8 @@ def feature_persistence_loss(
     query_points: torch.Tensor,
     fine_feature_maps: torch.Tensor,
     feature_stride: int,
-    visibility: torch.Tensor | None = None,
+    visibility: Optional[torch.Tensor] = None,
+    self_sup_mask_bqt: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Fine feature at tracked location should remain similar to query's fine feature.
 
@@ -411,6 +552,12 @@ def feature_persistence_loss(
     if visibility is not None:
         vis_prob = torch.sigmoid(visibility).detach()
         diff_stack = diff_stack * vis_prob
+
+    if self_sup_mask_bqt is not None:
+        m0 = self_sup_mask_bqt[:, :, :1].expand_as(diff_stack)
+        diff_stack = diff_stack * torch.minimum(
+            m0, self_sup_mask_bqt.detach(),
+        )
 
     return diff_stack.mean()
 
@@ -461,6 +608,9 @@ def compute_temporal_tracking_losses(
     patch_size: int,
     feature_stride: int,
     config,
+    self_sup_mask_bqt: Optional[torch.Tensor] = None,
+    cycle_weight_scale: float = 1.0,
+    synth_self_sup_scale: float = 1.0,
 ) -> dict:
     """Compute all self-supervised temporal tracking losses.
 
@@ -474,25 +624,29 @@ def compute_temporal_tracking_losses(
         patch_size:        Patch size for coarse descriptor grid.
         feature_stride:    Pixel stride of fine features.
         config:            DotMap config.
+        self_sup_mask_bqt: Optional ``[B,Q,T]`` validity for descriptor/feat/cycle/smooth on synthetic.
+        cycle_weight_scale: Multiplier on cycle loss weight (use ``0`` without backward tracking).
+        synth_self_sup_scale: Multiplier on cycle/smooth/desc/feat (not ``loss_vis`` reg).
 
     Returns:
         dict with ``loss_total`` (differentiable scalar) and ``metrics`` sub-dict.
     """
-    w_cycle = float(config.get("TEMPORAL_CYCLE_LOSS_WEIGHT", 1.0))
+    w_cycle = float(config.get("TEMPORAL_CYCLE_LOSS_WEIGHT", 1.0)) * float(cycle_weight_scale)
     w_smooth = float(config.get("TEMPORAL_SMOOTHNESS_LOSS_WEIGHT", 0.3))
     w_desc = float(config.get("TEMPORAL_DESC_LOSS_WEIGHT", 0.5))
     w_feat = float(config.get("TEMPORAL_FEATURE_LOSS_WEIGHT", 0.5))
     w_vis = float(config.get("TEMPORAL_VIS_REG_WEIGHT", 0.1))
+    w_synth = float(synth_self_sup_scale)
 
     loss_cycle = temporal_cycle_consistency_loss(
-        tracks, reverse_tracks, query_points, visibility,
+        tracks, reverse_tracks, query_points, visibility, self_sup_mask_bqt,
     )
-    loss_smooth = temporal_smoothness_loss(tracks, visibility)
+    loss_smooth = temporal_smoothness_loss(tracks, visibility, self_sup_mask_bqt)
     loss_desc = temporal_descriptor_consistency_loss(
-        tracks, query_points, descriptor_maps, patch_size, visibility,
+        tracks, query_points, descriptor_maps, patch_size, visibility, self_sup_mask_bqt,
     )
     loss_feat = feature_persistence_loss(
-        tracks, query_points, fine_feature_maps, feature_stride, visibility,
+        tracks, query_points, fine_feature_maps, feature_stride, visibility, self_sup_mask_bqt,
     )
     loss_vis = visibility_regularization_loss(visibility)
 
@@ -502,13 +656,13 @@ def compute_temporal_tracking_losses(
     loss_feat = torch.nan_to_num(loss_feat, nan=0.0)
     loss_vis = torch.nan_to_num(loss_vis, nan=0.0)
 
-    loss_total = (
+    loss_core = (
         w_cycle * loss_cycle
         + w_smooth * loss_smooth
         + w_desc * loss_desc
         + w_feat * loss_feat
-        + w_vis * loss_vis
     )
+    loss_total = w_synth * loss_core + w_vis * loss_vis
 
     metrics = {
         "loss_cycle": loss_cycle.item(),

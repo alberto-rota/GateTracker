@@ -25,11 +25,11 @@ parameters:
   IMAGE_WIDTH:
     value: 448
   BATCH_SIZE:
-    value: 8
+    value: 16
   SHUFFLE:
     value: True
   WORKERS:
-    value: 1
+    value: 6
   PIN_MEMORY:
     value: True
   PREFETCH_FACTOR:
@@ -42,9 +42,9 @@ parameters:
     value:
       SCARED:
         PATH: "/home/shared/nearmrs/arota/SCARED"
-        FPS: 32
+        FPS: 16
         FRAMESKIP: [1, 2, 4, 8, 16, 24, 32]
-        TRAIN_VIDEOS: ["train_v*"]
+        TRAIN_VIDEOS: ["train_v20*"]
         VAL_VIDEOS: ["test_*"]
         TEST_VIDEOS: ["test_*"]
         RANDOM_POSE_TRAINING: True
@@ -60,7 +60,7 @@ parameters:
 
       CHOLEC80:
         PATH: "/home/shared/nearmrs/arota/CHOLEC80/videos"
-        FPS: 80
+        FPS: 20
         FRAMESKIP: [1]
         TRAIN_VIDEOS: ["train_video02"]
         TEST_VIDEOS: ["test_video*"]
@@ -76,24 +76,24 @@ parameters:
         }
         CROP_ZOOM_FACTOR: 1.2
 
-      # STEREOMIS:
-      #   PATH: "StereoMIS_Tracking"
-      #   FPS: 4
-      #   FRAMESKIP: [1, 2]
-      #   TRAIN_VAL_SPLIT: 0.7
-      #   TRAIN_VIDEOS: ["train_*"]
-      #   VAL_VIDEOS: ["test_*"]
-      #   TEST_VIDEOS: ["test_*"]
-      #   RANDOM_POSE_TRAINING: True
-      #   RANDOM_POSE_RANGES: [2.5, 3.25]
-      #   CURRICULUM_FACTOR: 1
-      #   AUGMENTATION_PROBABILITY: {
-      #     COLOR: 0.8,
-      #     GEOMETRIC: 0.0,
-      #     REVERSE: 0.0,
-      #     STANDSTILL: 0.0
-      #   }
-      #   CROP_ZOOM_FACTOR: 1.2
+      STEREOMIS:
+        PATH: "/home/shared/nearmrs/arota/StereoMIS_Tracking"
+        FPS: 4
+        FRAMESKIP: [1, 2]
+        TRAIN_VAL_SPLIT: 0.7
+        TRAIN_VIDEOS: ["train_*"]
+        VAL_VIDEOS: ["test_*"]
+        TEST_VIDEOS: ["test_*"]
+        RANDOM_POSE_TRAINING: True
+        RANDOM_POSE_RANGES: [2.5, 3.25]
+        CURRICULUM_FACTOR: 1
+        AUGMENTATION_PROBABILITY: {
+          COLOR: 0.8,
+          GEOMETRIC: 0.0,
+          REVERSE: 0.0,
+          STANDSTILL: 0.0
+        }
+        CROP_ZOOM_FACTOR: 1.2
 
   # ===== BACKBONE =====
   DINO_MODEL_NAME:
@@ -195,7 +195,7 @@ parameters:
   WEIGHT_DECAY:
     value: 0.0
   GRADIENT_ACCUMULATION_STEPS:
-    value: 2
+    value: 1
   EPOCHS:
     value: 200
   WARMUP_STEPS:
@@ -203,7 +203,9 @@ parameters:
   EARLYSTOPPING_PATIENCE:
     value: 50
   LR_SCHEDULER:
-    value: "stepwise"
+    value: "cosine"
+  COSINESCHEDULER_NPERIODS:
+    value: 0.5
   STEPWISESCHEDULER_NSTEPS:
     value: 3
   STEPWISESCHEDULER_GAMMA:
@@ -224,3 +226,40 @@ parameters:
     value: 10
   MODEL_WATCHER_FREQ_WANDB:
     value: 5
+
+  # ===== STEREOMIS GT VALIDATION (PHASE=tracking, each val epoch) =====
+  # Requires DATASETS.STEREOMIS.PATH (and optional DATASET_ROOTDIR) so the root resolves.
+  TRACKING_STEREOMIS_VAL:
+    value: True
+  TRACKING_STEREOMIS_VAL_SEQUENCE:
+    value: "test_P3_1"
+  TRACKING_STEREOMIS_VAL_MAX_FRAMES:
+    value: null
+  TRACKING_STEREOMIS_VAL_GRID:
+    value: 10
+
+  # ===== PSEUDO-GT (novel-view) supervision for PHASE=tracking =====
+  # Hybrid training: per-step Bernoulli(PSEUDO_GT_MIX) replaces the window with pseudo
+  # views; supervised weight ramps to PSEUDO_GT_SUP_LAMBDA_MAX over PSEUDO_GT_CURRICULUM_EPOCHS.
+  PSEUDO_GT_MIX:
+    value: 0.25
+  PSEUDO_GT_SUP_LAMBDA_MAX:
+    value: 0.25
+  PSEUDO_GT_CURRICULUM_EPOCHS:
+    value: 10
+  PSEUDO_GT_GRID_SIZE:
+    value: 32
+  PSEUDO_GT_GRID_MARGIN_FRAC:
+    value: 0.03
+  PSEUDO_GT_MASK_ERODE_PX:
+    value: 0
+  PSEUDO_GT_VIS_APPEARANCE_AWARE:
+    value: False
+  PSEUDO_GT_SYNTH_SELF_SUP_SCALE:
+    value: 1.0
+  TEMPORAL_SUP_POS_WEIGHT:
+    value: 1.0
+  TEMPORAL_SUP_VIS_WEIGHT:
+    value: 1.0
+  TEMPORAL_SUP_HUBER_BETA:
+    value: 1.0

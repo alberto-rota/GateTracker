@@ -4,7 +4,7 @@ import time
 from collections import defaultdict
 from functools import wraps
 from pathlib import Path
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 import torch
@@ -433,12 +433,15 @@ class GeometryPipeline(nn.Module):
         print("=" * 60)
 
     @time_module("geometry_estimation")
-    def compute_geometry(self, image):
+    def compute_geometry(self, image, return_normalized: Optional[bool] = None):
         """
         Compute depth, normals, and intrinsics from RGB image(s) using MoGe, EndoSynth, or Intel models.
 
         Args:
             image: [B,3,H,W] RGB image (0-1 normalized) OR [B,2,3,H,W] pair of images
+            return_normalized: If ``None``, use ``self.return_normalized_depth``. If ``False``,
+                skip min–max depth normalisation so depth stays in **model units** (needed for
+                :class:`gatetracker.data.pseudo_gt.PseudoGTGenerator` metric consistency).
 
         Returns:
             tuple: (depth, normals, intrinsics)
@@ -540,12 +543,17 @@ class GeometryPipeline(nn.Module):
             normals = normals.view(B, num_images, *normals.shape[1:])  # [B,2,3,H,W]
             intrinsics = intrinsics.view(B, num_images, *intrinsics.shape[1:])  # [B,2,3,3]
 
-        if self.return_normalized_depth:
+        do_norm = (
+            self.return_normalized_depth
+            if return_normalized is None
+            else bool(return_normalized)
+        )
+        if do_norm:
             min_val = depth.min()
             max_val = depth.max()
             if max_val > min_val:
                 depth = (depth - min_val) / (max_val - min_val)
             else:
                 depth = torch.zeros_like(depth)
-    
+
         return depth, -normals, intrinsics

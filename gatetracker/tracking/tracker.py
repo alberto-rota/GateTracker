@@ -298,32 +298,143 @@ class TemporalTracker(nn.Module):
         frames: torch.Tensor,
         config,
         num_query_points: int = 64,
+        batch=None,
+        geometry_pipeline=None,
+        epoch: int = 0,
     ) -> dict:
-        """Run a full self-supervised training step on a frame window.
+        """Run a temporal training step (self-supervised ± pseudo-GT supervision).
 
-        Samples random query points, tracks forward and backward, and
-        computes all temporal self-supervised losses.
-
-        Feature extraction happens once under ``torch.no_grad``;
-        reversed-time features are obtained by flipping the cached tensors
-        rather than re-encoding, keeping the cost at T backbone passes total.
+        When ``PSEUDO_GT_MIX`` / ``PSEUDO_GT_SUP_LAMBDA_MAX`` trigger and
+        ``geometry_pipeline`` is set, replaces the window with on-the-fly
+        novel-view pseudo sequences and adds masked supervised losses.
 
         Args:
             frames: [B, T, 3, H, W] temporal window.
             config: DotMap config with loss weights.
-            num_query_points: Number of query points to sample.
+            num_query_points: Target number of query points (subsampled pseudo grid).
+            batch: Optional dataloader batch (reserved for future keys).
+            geometry_pipeline: :class:`~gatetracker.geometry.pipeline.GeometryPipeline`.
+            epoch: Current epoch (for curriculum on supervised weight).
 
         Returns:
             dict with ``loss_total`` (differentiable) and ``metrics`` sub-dict.
         """
-        from gatetracker.tracking.losses import compute_temporal_tracking_losses, _sample_query_grid
+        from gatetracker.data.pseudo_gt import (
+            DeformationConfig,
+            GridConfig,
+            PseudoGTGenerator,
+            TrajectoryConfig,
+        )
+        from gatetracker.tracking.losses import (
+            _sample_query_grid,
+            composite_supervision_mask,
+            compute_temporal_tracking_losses,
+            temporal_supervised_losses,
+            validity_at_tracks_bqt,
+        )
 
         B, T, _, H, W = frames.shape
+        device = frames.device
 
-        query_points = _sample_query_grid(B, H, W, num_query_points, frames.device)  # [B, Q, 2]
+        lam_max = float(config.get("PSEUDO_GT_SUP_LAMBDA_MAX", 0.0))
+        mix = float(config.get("PSEUDO_GT_MIX", 0.0))
+        use_pseudo = (
+            lam_max > 0.0
+            and mix > 0.0
+            and geometry_pipeline is not None
+            and torch.rand((), device=device).item() < mix
+        )
+        _ = batch  # reserved for offline GT / paths
+
+        frames_in = frames
+        query_points = _sample_query_grid(B, H, W, num_query_points, device)  # [B, Q, 2]
+        cycle_weight_scale = 1.0
+        synth_self_sup_scale = float(config.get("PSEUDO_GT_SYNTH_SELF_SUP_SCALE", 1.0))
+        self_sup_mask_bqt = None
+        tracks_gt = None
+        vis_gt = None
+        vis_target = None
+        composite_m = None
+
+        if use_pseudo:
+            key = (H, W, str(device))
+            if getattr(self, "_pseudo_gt_hw_device", None) != key:
+                self._pseudo_gt_gen = PseudoGTGenerator(H, W, device=str(device))
+                self._pseudo_gt_hw_device = key
+
+            grid_sz = int(config.get("PSEUDO_GT_GRID_SIZE", 32))
+            grid_cfg = GridConfig(
+                grid_size=grid_sz,
+                margin_frac=float(config.get("PSEUDO_GT_GRID_MARGIN_FRAC", 0.03)),
+            )
+            erode = int(config.get("PSEUDO_GT_MASK_ERODE_PX", 0))
+
+            with torch.no_grad():
+                depth, _, K = geometry_pipeline.compute_geometry(
+                    frames[:, 0], return_normalized=False,
+                )
+
+            synth_list = []
+            tg_list = []
+            vg_list = []
+            fv_list = []
+            qp_list = []
+            Q_full = grid_sz * grid_sz
+
+            for b in range(B):
+                seed_u = int(epoch * 100003 + b * 17 + 1)
+                res = self._pseudo_gt_gen.generate(
+                    image=frames[b : b + 1, 0],
+                    depth=depth[b : b + 1],
+                    intrinsics=K[b : b + 1],
+                    trajectory=TrajectoryConfig(n_frames=T),
+                    deformation=DeformationConfig(),
+                    grid=grid_cfg,
+                    seed=seed_u,
+                    frame_valid_erode_px=erode,
+                )
+                synth_list.append(res.frames)  # [T, 3, H, W]
+                tr = res.tracks  # [T, Q_full, 2]
+                vi = res.visibility.to(dtype=torch.float32, device=device)
+                fv = res.frame_valid  # [T, 1, H, W]
+                qp = res.query_pixels  # [Q_full, 2]
+
+                Qeff = min(num_query_points, Q_full)
+                g = torch.Generator(device=device)
+                g.manual_seed(seed_u)
+                idx = torch.randperm(Q_full, generator=g, device=device)[:Qeff]
+
+                tr_s = tr[:, idx, :]  # [T, Qeff, 2]
+                vi_s = vi[:, idx]
+                qp_s = qp[idx, :]
+
+                tg_list.append(tr_s.permute(1, 0, 2).unsqueeze(0))  # [1, Qeff, T, 2]
+                vg_list.append(vi_s.permute(1, 0).unsqueeze(0))  # [1, Qeff, T]
+                fv_list.append(fv.unsqueeze(0))  # [1, T, 1, H, W]
+                qp_list.append(qp_s.unsqueeze(0))
+
+            frames_in = torch.stack(synth_list, dim=0)  # [B, T, 3, H, W]
+            tracks_gt = torch.cat(tg_list, dim=0)  # [B, Q, T, 2]
+            vis_gt = torch.cat(vg_list, dim=0)  # [B, Q, T]
+            frame_valid_bt = torch.cat(fv_list, dim=0)  # [B, T, 1, H, W]
+            query_points = torch.cat(qp_list, dim=0)  # [B, Q, 2]
+
+            w_rgb = validity_at_tracks_bqt(frame_valid_bt, tracks_gt, H, W)
+            composite_m = composite_supervision_mask(
+                vis_gt, w_rgb, tracks_gt, H, W,
+            )
+            self_sup_mask_bqt = composite_m
+
+            appearance_aware = bool(config.get("PSEUDO_GT_VIS_APPEARANCE_AWARE", False))
+            if appearance_aware:
+                vis_target = vis_gt * w_rgb
+            else:
+                vis_target = vis_gt
+
+            cycle_weight_scale = 0.0
 
         # --- Feature extraction (single pass, frozen) ---
-        descriptor_maps, fine_feature_maps = self._encode_all_frames(frames)
+        descriptor_maps, fine_feature_maps = self._encode_all_frames(frames_in)
 
         if fine_feature_maps is None:
             raise RuntimeError(
@@ -346,18 +457,21 @@ class TemporalTracker(nn.Module):
         vis_fwd = fwd_out["visibility"]      # [B, Q, T]
 
         # --- Backward tracking (reuse features, flip time) ---
-        desc_maps_rev = descriptor_maps[::-1]
-        fine_rev = fine_feature_maps.flip(dims=[1])
+        if cycle_weight_scale > 0.0:
+            desc_maps_rev = descriptor_maps[::-1]
+            fine_rev = fine_feature_maps.flip(dims=[1])
 
-        rev_query = tracks_fwd[:, :, -1, :].detach()  # [B, Q, 2]
-        coarse_rev = self._global_coarse_match(rev_query, desc_maps_rev)
-        rev_query_fine = correspondence.sample_embeddings_at_points(
-            fine_rev[:, 0], rev_query, feature_stride,
-        )
-        bwd_out = self.refinement_net(
-            coarse_rev, rev_query_fine, fine_rev, feature_stride,
-        )
-        tracks_bwd = bwd_out["tracks"].flip(dims=[2])  # [B, Q, T, 2]
+            rev_query = tracks_fwd[:, :, -1, :].detach()  # [B, Q, 2]
+            coarse_rev = self._global_coarse_match(rev_query, desc_maps_rev)
+            rev_query_fine = correspondence.sample_embeddings_at_points(
+                fine_rev[:, 0], rev_query, feature_stride,
+            )
+            bwd_out = self.refinement_net(
+                coarse_rev, rev_query_fine, fine_rev, feature_stride,
+            )
+            tracks_bwd = bwd_out["tracks"].flip(dims=[2])  # [B, Q, T, 2]
+        else:
+            tracks_bwd = tracks_fwd.detach()
 
         # --- Losses ---
         patch_size = self.matcher.patch_size
@@ -371,6 +485,33 @@ class TemporalTracker(nn.Module):
             patch_size=patch_size,
             feature_stride=feature_stride,
             config=config,
+            self_sup_mask_bqt=self_sup_mask_bqt,
+            cycle_weight_scale=cycle_weight_scale,
+            synth_self_sup_scale=synth_self_sup_scale,
         )
+
+        loss_total = loss_dict["loss_total"]
+
+        if use_pseudo and tracks_gt is not None and vis_target is not None and composite_m is not None:
+            sup = temporal_supervised_losses(
+                tracks_pred=tracks_fwd,
+                visibility_pred=vis_fwd,
+                tracks_gt=tracks_gt,
+                composite_mask=composite_m,
+                vis_target=vis_target,
+                config=config,
+            )
+            cur_epochs = max(1, int(config.get("PSEUDO_GT_CURRICULUM_EPOCHS", 10)))
+            lam = lam_max * min(1.0, float(epoch + 1) / float(cur_epochs))
+            loss_total = (1.0 - lam) * loss_total + lam * sup["loss_sup_total"]
+            loss_dict["metrics"].update(sup["metrics"])
+            loss_dict["metrics"]["pseudo_lambda"] = lam
+            loss_dict["metrics"]["pseudo_gt_active"] = 1.0
+        else:
+            loss_dict["metrics"]["pseudo_gt_active"] = 0.0
+            loss_dict["metrics"]["pseudo_lambda"] = 0.0
+
+        loss_dict["loss_total"] = loss_total
+        loss_dict["metrics"]["loss_total"] = float(loss_total.detach().item())
 
         return loss_dict

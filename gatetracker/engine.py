@@ -1704,7 +1704,13 @@ class Engine:
         epoch_batch_info = (
             f"E{epoch + 1}/{self.epochs} B{batch_idx + 1}/{dataloader_len}"
         )
-        printedrunname = abbrev_wandb_run_tag(self.runname)
+        # Under Slurm, use scheduler job name (#SBATCH --job-name) verbatim — no abbrev alias.
+        slurm_job_name = (os.environ.get("SLURM_JOB_NAME") or "").strip()
+        printedrunname = (
+            slurm_job_name
+            if slurm_job_name
+            else abbrev_wandb_run_tag(self.runname)
+        )
         tag_col = len(printedrunname) + 1
         metricstring = align(f"{printedrunname}:", tag_col, "right") + epoch_batch_info
         if extra_info is not None:
@@ -1965,6 +1971,10 @@ class Engine:
         TRAINING = phase == "Training"
         seq_ds = self._tracking_datasets.get(phase)
         if seq_ds is None:
+            # Still run StereoMIS GT / video eval on validation epochs so GT vs pred
+            # MP4s are produced even when SequenceWindowDataset(Validation) failed to build.
+            if not TRAINING:
+                self._tracking_validate_stereomis_gt(epoch)
             return "SKIP"
 
         if TRAINING:
@@ -1991,6 +2001,8 @@ class Engine:
         )
 
         if len(dataloader) == 0:
+            if not TRAINING:
+                self._tracking_validate_stereomis_gt(epoch)
             return "EMPTY"
 
         num_query_pts = int(self.config.get("TRACKING_NUM_QUERY_POINTS", 64))
@@ -2002,7 +2014,12 @@ class Engine:
                 frames = batch["frames"].to(self.device)  # [B, T, 3, H, W]
 
                 loss_dict = self.temporal_tracker.training_step(
-                    frames, self.config, num_query_points=num_query_pts,
+                    frames,
+                    self.config,
+                    num_query_points=num_query_pts,
+                    batch=batch,
+                    geometry_pipeline=self.geometryPipeline,
+                    epoch=epoch,
                 )
 
                 loss_total = loss_dict["loss_total"]
@@ -2024,7 +2041,11 @@ class Engine:
                 metrics["Smooth"] = m.get("loss_smooth", 0.0)
                 metrics["Desc"] = m.get("loss_desc", 0.0)
                 metrics["Feat"] = m.get("loss_feat", 0.0)
-                metrics["VisReg"] = m.get("loss_vis_reg", 0.0)
+                metrics["VisReg"] = m.get("loss_vis", m.get("loss_vis_reg", 0.0))
+                metrics["SupPos"] = m.get("loss_sup_pos", 0.0)
+                metrics["SupVis"] = m.get("loss_sup_vis", 0.0)
+                metrics["PseudoLam"] = m.get("pseudo_lambda", 0.0)
+                metrics["PseudoOn"] = m.get("pseudo_gt_active", 0.0)
 
                 new_row = pd.DataFrame([metrics])
                 self.metrics[phase] = pd.concat(
@@ -2046,6 +2067,9 @@ class Engine:
 
                 del frames, loss_dict, loss_total
                 torch.cuda.empty_cache()
+
+        if not TRAINING:
+            self._tracking_validate_stereomis_gt(epoch)
 
         if epoch_losses:
             mean_loss = np.mean(epoch_losses)
@@ -2071,6 +2095,230 @@ class Engine:
                     return "EARLYSTOP"
 
         return "COMPLETED"
+
+    def _tracking_validate_stereomis_gt(self, epoch: int) -> None:
+        """Run TAP-Vid metrics on StereoMIS GT tracks for one sequence; log video + scalars to W&B.
+
+        Mirrors ``test_stereomis_p3.py`` / ``run_tracking_evaluation``: grid video plus GT-initialized
+        ``track_long_sequence``, comparison video, and ``compute_tap_metrics``.
+        """
+        if not bool(self.config.get("TRACKING_STEREOMIS_VAL", True)):
+            return
+        if not hasattr(self, "temporal_tracker") or self.temporal_tracker is None:
+            return
+
+        from gatetracker.data import StereoMISTracking
+        from gatetracker.tracking.metrics import compute_tap_metrics
+        from gatetracker.utils.visualization import (
+            make_grid_points,
+            render_comparison_video,
+            render_tracks_video,
+        )
+
+        datasets_config = self.config.get("DATASETS", {}) or {}
+        stereomis_config = datasets_config.get("STEREOMIS", None)
+        if stereomis_config is None:
+            self.logger.info(
+                "TRACKING_STEREOMIS_VAL requires DATASETS.STEREOMIS.PATH; skipping.",
+                context="TRACKING",
+            )
+            return
+
+        config_path = stereomis_config.get("PATH", "StereoMIS_Tracking")
+        dataset_rootdir = os.environ.get("DATASET_ROOTDIR")
+        if dataset_rootdir and not os.path.isabs(config_path):
+            root = os.path.join(dataset_rootdir, config_path)
+        else:
+            root = config_path
+
+        seq_name = str(self.config.get("TRACKING_STEREOMIS_VAL_SEQUENCE", "test_P3_1"))
+        seq_dir = os.path.join(root, seq_name)
+        if not os.path.isdir(seq_dir):
+            available = StereoMISTracking.available_sequences(root)
+            if len(available) == 0:
+                self.logger.info(
+                    f"TRACKING_STEREOMIS_VAL: no sequences under {root}; skipping.",
+                    context="TRACKING",
+                )
+                return
+            p3 = [s for s in available if "P3" in s]
+            seq_name = p3[0] if p3 else available[0]
+            self.logger.info(
+                f"TRACKING_STEREOMIS_VAL: resolved sequence {seq_name} (requested path missing).",
+                context="TRACKING",
+            )
+
+        mf = self.config.get("TRACKING_STEREOMIS_VAL_MAX_FRAMES", None)
+        stop: Optional[int] = None
+        if mf is not None and mf != "":
+            try:
+                iv = int(mf)
+                if iv > 0:
+                    stop = iv
+            except (TypeError, ValueError):
+                pass
+
+        height = int(self.height)
+        width = int(self.width)
+        window_size = int(
+            self.config.get(
+                "TRACKING_SEQUENCE_LENGTH",
+                self.config.get("TRACKING_WINDOW_SIZE", 16),
+            )
+        )
+        fps = int(stereomis_config.get("FPS", 4))
+        grid_size = int(self.config.get("TRACKING_STEREOMIS_VAL_GRID", 10))
+
+        try:
+            ds = StereoMISTracking(
+                root=root,
+                sequence=seq_name,
+                height=height,
+                width=width,
+                start=0,
+                stop=stop,
+                step=1,
+            )
+        except (FileNotFoundError, RuntimeError, OSError) as e:
+            self.logger.warning(
+                f"TRACKING_STEREOMIS_VAL: could not open {seq_name}: {e}",
+                context="TRACKING",
+            )
+            return
+
+        if len(ds) < 2:
+            self.logger.info(
+                f"TRACKING_STEREOMIS_VAL: {seq_name} has <2 frames; skipping.",
+                context="TRACKING",
+            )
+            return
+        if ds.tracking_points is None:
+            self.logger.info(
+                f"TRACKING_STEREOMIS_VAL: {seq_name} has no GT (track_pts.pckl); skipping.",
+                context="TRACKING",
+            )
+            return
+
+        out_dir = os.path.join(self.RUN_DIR, "stereomis_val")
+        os.makedirs(out_dir, exist_ok=True)
+        self.logger.info(
+            f"TRACKING_STEREOMIS_VAL: writing videos under {os.path.abspath(out_dir)}",
+            context="TRACKING",
+        )
+
+        self.temporal_tracker.eval()
+        # [1, T, 3, H, W] — same device as training
+        all_frames = torch.stack(
+            [ds[t]["image"] for t in range(len(ds))], dim=0,
+        ).unsqueeze(0).to(self.device)
+
+        h, w = ds[0]["image"].shape[1:]
+        grid_pts = make_grid_points(h, w, grid_h=grid_size, grid_w=grid_size)
+
+        prefix = "Validation/stereomis_gt"
+
+        with torch.no_grad():
+            grid_out = self.temporal_tracker.track_long_sequence(
+                grid_pts.unsqueeze(0).to(self.device),
+                all_frames,
+                window_size=window_size,
+            )
+            grid_traj = grid_out["tracks"].squeeze(0).permute(1, 0, 2).cpu()  # [T, N, 2]
+
+            gt_init = ds.tracking_points[:, 0, :].to(self.device)  # [N_gt, 2]
+            gt_out = self.temporal_tracker.track_long_sequence(
+                gt_init.unsqueeze(0),
+                all_frames,
+                window_size=window_size,
+            )
+        pred_tracks = gt_out["tracks"].squeeze(0)  # [N_gt, T, 2]
+        vis_logits = gt_out["visibility"].squeeze(0)  # [N_gt, T]
+        pred_vis = torch.sigmoid(vis_logits) > 0.5
+
+        T_pred = pred_tracks.shape[1]
+        gt_tracks = ds.tracking_points[:, :T_pred, :].to(pred_tracks.device)
+        gt_vis = ds.visibility[:, :T_pred].to(pred_tracks.device)
+
+        results = compute_tap_metrics(pred_tracks, gt_tracks, gt_vis, pred_vis)
+        self.logger.info(
+            f">> {prefix} epoch {epoch + 1} [{seq_name}]  "
+            f"delta_avg={results['delta_avg']:.4f}  OA={results['OA']:.4f}  AJ={results['AJ']:.4f}",
+            context="TRACKING",
+        )
+
+        wb_step = epoch
+        log_payload: Dict[str, Any] = {
+            f"{prefix}/{seq_name}/delta_avg": results["delta_avg"],
+            f"{prefix}/{seq_name}/OA": results["OA"],
+            f"{prefix}/{seq_name}/AJ": results["AJ"],
+        }
+
+        grid_path = os.path.join(out_dir, f"{seq_name}_grid_ep{epoch:04d}.mp4")
+        cmp_path = os.path.join(out_dir, f"{seq_name}_gt_vs_pred_ep{epoch:04d}.mp4")
+        try:
+            render_tracks_video(
+                dataset=ds,
+                trajectories=grid_traj,
+                output_path=grid_path,
+                fps=max(fps, 4),
+                trail_length=max(5, fps),
+                point_radius=3,
+            )
+            pixel_errors = (pred_tracks.cpu() - gt_tracks.cpu()).norm(dim=-1)  # [N_gt, T_pred]
+            gt_vid = gt_tracks.permute(1, 0, 2).cpu()  # [T, N, 2]
+            pred_vid = pred_tracks.permute(1, 0, 2).cpu()
+            render_comparison_video(
+                dataset=ds,
+                pred_trajectories=pred_vid,
+                gt_trajectories=gt_vid,
+                output_path=cmp_path,
+                fps=max(fps, 4),
+                trail_length=max(5, fps),
+                point_radius=3,
+                visibility=gt_vis.cpu(),
+                errors=pixel_errors,
+            )
+            self.logger.info(
+                "TRACKING_STEREOMIS_VAL: saved grid tracks video: "
+                f"{os.path.abspath(grid_path)}",
+                context="TRACKING",
+            )
+            self.logger.info(
+                "TRACKING_STEREOMIS_VAL: saved GT vs predicted tracks video: "
+                f"{os.path.abspath(cmp_path)}",
+                context="TRACKING",
+            )
+            if self.wandb is None:
+                self.logger.info(
+                    "TRACKING_STEREOMIS_VAL: W&B is off; open the MP4 paths above locally.",
+                    context="TRACKING",
+                )
+        except RuntimeError as e:
+            self.logger.warning(
+                f"TRACKING_STEREOMIS_VAL: video render failed: {e}",
+                context="TRACKING",
+            )
+            grid_path, cmp_path = None, None
+
+        if self.wandb is not None:
+            try:
+                if grid_path is not None and os.path.isfile(grid_path):
+                    log_payload[f"{prefix}/grid_video"] = wandb.Video(
+                        grid_path, fps=max(fps, 4), format="mp4"
+                    )
+                if cmp_path is not None and os.path.isfile(cmp_path):
+                    log_payload[f"{prefix}/gt_vs_pred_video"] = wandb.Video(
+                        cmp_path, fps=max(fps, 4), format="mp4"
+                    )
+                self.wandb.log(log_payload, step=wb_step)
+            except Exception as e:
+                self.logger.warning(
+                    f"TRACKING_STEREOMIS_VAL: wandb log failed: {e}",
+                    context="TRACKING",
+                )
+
+        del all_frames, grid_out, gt_out
+        torch.cuda.empty_cache()
 
     def save_pretrained_descriptors(self, path: Optional[str] = None) -> str:
         """Export a descriptor-only checkpoint for Phase 2 tracking training.

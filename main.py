@@ -26,8 +26,13 @@ def run_pipeline(mode="train", config=None):
     parser.add_argument("--boot", "-b", action="store_true", help="Minimal smoke-test mode")
     parser.add_argument("--config", "-c", type=str, default=None, help="Config YAML path")
     parser.add_argument("--record", "-r", action="store_true", help="Record run notes")
-    args, unknown = parser.parse_known_args()
-    mode = args.mode
+    if config is not None:
+        # wandb agent passes --KEY=value for every sweep param; argparse would treat the first
+        # token as positional ``mode`` and fail. Use defaults + explicit ``mode`` from the caller.
+        args, unknown = parser.parse_known_args([])
+    else:
+        args, unknown = parser.parse_known_args()
+        mode = args.mode
 
     # System info
     logger.info(f"PyTorch {torch.__version__} | CUDA {torch.version.cuda} | Python {__import__('sys').version.split()[0]}")
