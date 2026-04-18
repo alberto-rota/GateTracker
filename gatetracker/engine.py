@@ -38,6 +38,17 @@ from gatetracker.utils.training_phase import (
     normalize_pipeline_phase,
     pairwise_tracking_enabled,
 )
+from gatetracker.distributed_context import (
+    all_reduce_sum_scalars,
+    is_ddp_enabled,
+    is_main_process,
+    ShardedListSampler,
+    unwrap_model,
+)
+from gatetracker.env_bootstrap import (
+    pretrained_checkpoint_path_candidates,
+    resolve_dataset_filesystem_path,
+)
 from gatetracker.utils.formatting import (
     metrics_for_wandb,
     align,
@@ -82,7 +93,7 @@ class Engine:
         self.config = config
         self.config["NOTES"] = notes
 
-        device_dirs = initialize.device_and_directories()
+        device_dirs = initialize.device_and_directories(config)
         self.device = device_dirs["device"]
         self.RUNS_DIR = device_dirs["runs_dir"]
 
@@ -103,6 +114,7 @@ class Engine:
             self.learning_rate,
         )
         init(initialize.matching_pipeline, config, model, self.device)
+        self._wrap_matcher_parallel()
         init(initialize.optimizers, self.matcher.model, config)
         init(initialize.loss_functions, config)
         init(initialize.tracking_loss_functions, config)
@@ -117,13 +129,13 @@ class Engine:
         )
 
         init(initialize.tracking_metrics)
-        init(initialize.setup_run_directories, self.RUNS_DIR, self.wandb, False)
+        init(initialize.setup_run_directories, self.RUNS_DIR, self.wandb, False, config)
         self.config["name"] = self.runname
 
         geometry_model_name = self.config.get("GEOMETRY_MODEL_NAME", "Ruicheng/moge-2-vits-normal")
         self.geometryPipeline = GeometryPipeline(
             geometry_model_name=geometry_model_name,
-            device="cuda",
+            device=str(self.device),
             height=self.height,
             width=self.width,
             return_normalized_depth=True,
@@ -139,6 +151,8 @@ class Engine:
         self.metrics_logger = MetricsLogger(
             wandb_run=self.wandb, run_name=self.runname
         )
+        # Monotonic W&B x-axis for ``run_tests`` / eval media (``step/test_eval``).
+        self._wandb_test_eval_step = 0
 
         self.refinement_metric_names = {
             "RefinementActiveFraction",
@@ -151,6 +165,24 @@ class Engine:
             "RefinementWinRate",
             "RefinementGainConfidenceCorr",
         }
+
+    def _wrap_matcher_parallel(self) -> None:
+        """Wrap ``self.matcher.model`` in DDP or DataParallel when configured."""
+        import torch.nn as nn
+
+        from gatetracker.distributed_context import is_ddp_enabled, is_dp_enabled
+
+        if is_ddp_enabled(self.config):
+            lr = int(self.config.get("LOCAL_RANK", 0))
+            self.matcher.model = nn.parallel.DistributedDataParallel(
+                self.matcher.model,
+                device_ids=[lr],
+                output_device=lr,
+                find_unused_parameters=True,
+            )
+        elif is_dp_enabled(self.config):
+            if self.device.type == "cuda" and torch.cuda.device_count() > 1:
+                self.matcher.model = nn.DataParallel(self.matcher.model)
 
     def _resolve_pretrained_checkpoint_path(self, checkpoint_ref: str) -> Optional[str]:
         """
@@ -167,19 +199,7 @@ class Engine:
         if os.path.isfile(ref):
             return ref
 
-        looks_like_run_name = (os.sep not in ref) and (not os.path.splitext(ref)[1])
-        if not looks_like_run_name:
-            return None
-
-        candidate_paths = [
-            os.path.join(self.RUNS_DIR, ref, "models", f"{ref}_checkpoint.pth"),
-            os.path.join(self.RUNS_DIR, ref, "checkpoints", "weights_best.pt"),
-            os.path.join("runs", ref, "models", f"{ref}_checkpoint.pth"),
-            os.path.join("runs", ref, "checkpoints", "weights_best.pt"),
-            os.path.join("checkpoints", f"{ref}_checkpoint.pth"),
-            os.path.join("checkpoints", f"{ref}.pt"),
-        ]
-        for candidate in candidate_paths:
+        for candidate in pretrained_checkpoint_path_candidates(ref, runs_dir=self.RUNS_DIR):
             if os.path.isfile(candidate):
                 return candidate
         return None
@@ -199,16 +219,25 @@ class Engine:
 
         resolved_path = self._resolve_pretrained_checkpoint_path(checkpoint_ref)
         if resolved_path is not None:
-            self.matcher.model.fromArtifact(pth_namestring=resolved_path)
+            unwrap_model(self.matcher.model).fromArtifact(pth_namestring=resolved_path)
             self.logger.info(
                 f"Model loaded from checkpoint: {resolved_path}", context="LOAD"
             )
             return
 
-        self.matcher.model.fromArtifact(model_name=checkpoint_ref)
+        unwrap_model(self.matcher.model).fromArtifact(model_name=checkpoint_ref)
         self.logger.info(
             f"Model loaded from artifact/model name: {checkpoint_ref}", context="LOAD"
         )
+
+    def _wandb_epoch_axis_dict(self, epoch: int) -> Dict[str, int]:
+        """W&B x-axis payload for epoch-level scalars (``define_metric`` → ``step/epoch``)."""
+        return {"step/epoch": int(epoch)}
+
+    def _wandb_test_eval_step_dict(self) -> Dict[str, int]:
+        """W&B x-axis for post-hoc test tracking / summary logs (``step/test_eval``)."""
+        self._wandb_test_eval_step += 1
+        return {"step/test_eval": self._wandb_test_eval_step}
 
     def _namespace_refinement_metrics(self, metrics_dict, phase_prefix):
         """
@@ -233,14 +262,18 @@ class Engine:
             remapped[key] = value
         return remapped
 
-    def _optimizer_lr_metrics(self) -> Dict[str, float]:
-        """Scalar LR keys for logging (primary group + per-group names when present)."""
+    def _optimizer_lr_metrics(self, phase: str) -> Dict[str, float]:
+        """Scalar LR keys for logging (primary group + per-group names when present).
+
+        Keys are phase-prefixed so W&B can bind LR to ``step/val_batch`` vs
+        ``step/train_batch`` via ``{phase}/optim/*`` (see ``register_wandb_step_axes``).
+        """
         out: Dict[str, float] = {
-            "HyperParameters/LR": float(self.optimizer.param_groups[0]["lr"]),
+            f"{phase}/optim/LR": float(self.optimizer.param_groups[0]["lr"]),
         }
         for i, g in enumerate(self.optimizer.param_groups):
             gname = g.get("group_name", f"group_{i}")
-            out[f"HyperParameters/LR/{gname}"] = float(g["lr"])
+            out[f"{phase}/optim/LR/{gname}"] = float(g["lr"])
         return out
 
     def trainloop(self) -> None:
@@ -263,8 +296,13 @@ class Engine:
             self.train()
             training_status = self.validate()
 
-            self.dataset["Training"].reset_sampler()
-            self.dataset["Validation"].reset_sampler()
+            if is_ddp_enabled(self.config):
+                nxt = int(e) + 1
+                self.dataset["Training"].reset_sampler(next_shuffle_epoch=nxt)
+                self.dataset["Validation"].reset_sampler(next_shuffle_epoch=nxt)
+            else:
+                self.dataset["Training"].reset_sampler()
+                self.dataset["Validation"].reset_sampler()
 
             if e % self.dataset["Training"].max_steps_frameskip == 0 and e > 0:
                 self.dataset["Training"].step_frameskip_curriculum()
@@ -339,7 +377,7 @@ class Engine:
             self._init_tracking_phase()
             refine_ckpt = os.path.join(self.MODELS_DIR, "tracking_refinement_net.pt")
             if os.path.isfile(refine_ckpt):
-                self.temporal_tracker.refinement_net.load_state_dict(
+                unwrap_model(self.temporal_tracker.refinement_net).load_state_dict(
                     torch.load(refine_ckpt, map_location=self.device, weights_only=True)
                 )
                 self.logger.info(f"Loaded refinement net from {refine_ckpt}", context="TEST")
@@ -381,16 +419,31 @@ class Engine:
         images_logged = False
         dataset = self.dataset[PHASE]
 
-        dataloader = torch.utils.data.DataLoader(
-            dataset,
-            batch_size=self.batch_size,
-            num_workers=self.config.WORKERS,
-            drop_last=True,
-            sampler=dataset.sampler,
-            pin_memory=self.config.PIN_MEMORY,
-            prefetch_factor=self.config.PREFETCH_FACTOR,
-            collate_fn=collate_fn,
-        )
+        if is_ddp_enabled(self.config):
+            r = int(self.config.get("RANK", 0))
+            ws = int(self.config.get("WORLD_SIZE", 1))
+            _sampler = ShardedListSampler(dataset, r, ws)
+            dataloader = torch.utils.data.DataLoader(
+                dataset,
+                batch_size=self.batch_size,
+                num_workers=self.config.WORKERS,
+                drop_last=True,
+                sampler=_sampler,
+                pin_memory=self.config.PIN_MEMORY,
+                prefetch_factor=self.config.PREFETCH_FACTOR,
+                collate_fn=collate_fn,
+            )
+        else:
+            dataloader = torch.utils.data.DataLoader(
+                dataset,
+                batch_size=self.batch_size,
+                num_workers=self.config.WORKERS,
+                drop_last=True,
+                sampler=dataset.sampler,
+                pin_memory=self.config.PIN_MEMORY,
+                prefetch_factor=self.config.PREFETCH_FACTOR,
+                collate_fn=collate_fn,
+            )
 
         self.switch_optimizer(epoch)
         warmup_base_lrs = [float(g["lr"]) for g in self.optimizer.param_groups]
@@ -689,9 +742,6 @@ class Engine:
                     triplets_dict=triplets,
                 )
                 metrics.update({f"{PHASE}/{k}": v for k, v in architecture_metrics.items()})
-                if tracking_result is not None:
-                    for key, val in tracking_result["metrics"].items():
-                        metrics[f"{PHASE}/tracking/{key}"] = val
 
                 metrics.update(
                     {
@@ -716,9 +766,9 @@ class Engine:
                             if TRAINING
                             else None
                         ),
-                        "Gradients/GradNorm": backward_output.get("grad_norm"),
-                        "Gradients/WeightNorm": backward_output.get("weight_norm"),
-                        **self._optimizer_lr_metrics(),
+                        f"{PHASE}/optim/GradNorm": backward_output.get("grad_norm"),
+                        f"{PHASE}/optim/WeightNorm": backward_output.get("weight_norm"),
+                        **self._optimizer_lr_metrics(PHASE),
                         f"Step/{'val' if VALIDATION else ''}batch": self.step[
                             f"{PHASE}_batch"
                         ],
@@ -760,6 +810,9 @@ class Engine:
                     images_logged = True
 
                 metrics_row = {k: v for k, v in metrics.items()}
+                if tracking_result is not None:
+                    for _tk, _tv in tracking_result["metrics"].items():
+                        metrics_row[f"{PHASE}/tracking/{_tk}"] = _tv
                 new_row_df = pd.DataFrame([metrics_row])
                 self.metrics[PHASE] = pd.concat(
                     [self.metrics[PHASE], new_row_df],
@@ -774,9 +827,10 @@ class Engine:
                     total_batches=len(dataloader),
                     metrics=metrics,
                     extra_info="W" if warming_up else None,
+                    tracking_metrics=(
+                        tracking_result["metrics"] if tracking_result is not None else None
+                    ),
                 )
-                if tracking_result is not None:
-                    self.metrics_logger.log_tracking(PHASE, tracking_result["metrics"])
 
                 if images_for_wandb is not None:
                     self.metrics_logger.log_images(PHASE, images_for_wandb)
@@ -849,12 +903,26 @@ class Engine:
         )
 
         validation_loss = None
+        loss_key = f"{PHASE}/epoch/Loss"
         if VALIDATION:
-            loss_key = f"{PHASE}/epoch/Loss"
+            epoch_df_val = self.metrics[PHASE][
+                self.metrics[PHASE][f"Step/{epochstr}"] == epoch
+            ]
+            if "Loss" in epoch_df_val.columns and len(epoch_df_val) > 0:
+                loss_sum = float(epoch_df_val["Loss"].sum())
+                cnt = float(len(epoch_df_val))
+            else:
+                loss_sum, cnt = 0.0, 0.0
+            if is_ddp_enabled(self.config):
+                loss_sum, cnt = all_reduce_sum_scalars(loss_sum, cnt, self.device)
+            if cnt <= 0:
+                raise ValueError(f"Cannot find validation loss for epoch {epoch}")
+            validation_loss = loss_sum / cnt
             if loss_key in epoch_metrics:
-                validation_loss = float(epoch_metrics[loss_key])
+                epoch_metrics[loss_key] = validation_loss
 
         if self.wandb is not None:
+            epoch_metrics.update(self._wandb_epoch_axis_dict(epoch))
             self.wandb.log(epoch_metrics)
             del epoch_metrics
 
@@ -868,14 +936,6 @@ class Engine:
             )
             gc.collect()
         if VALIDATION:
-            if validation_loss is None:
-                epoch_df_slice = self.metrics[PHASE][
-                    self.metrics[PHASE][f"Step/{epochstr}"] == epoch
-                ]
-                if "Loss" in epoch_df_slice.columns and len(epoch_df_slice) > 0:
-                    validation_loss = float(epoch_df_slice["Loss"].mean())
-                else:
-                    raise ValueError(f"Cannot find validation loss for epoch {epoch}")
             self.step[epochstr] += 1
             if self.LRschedulerPlateau is not None:
                 self.LRschedulerPlateau.step(validation_loss)
@@ -1019,11 +1079,9 @@ class Engine:
             return
 
         config_path = stereomis_config.get("PATH", "StereoMIS_Tracking")
-        dataset_rootdir = os.environ.get("DATASET_ROOTDIR")
-        if dataset_rootdir and not os.path.isabs(config_path):
-            root = os.path.join(dataset_rootdir, config_path)
-        else:
-            root = config_path
+        root = resolve_dataset_filesystem_path(config_path, "STEREOMIS")
+        if root is None:
+            root = os.path.expandvars(os.path.expanduser(str(config_path)))
 
         sequences = StereoMISTracking.available_sequences(root)
         if len(sequences) == 0:
@@ -1131,11 +1189,14 @@ class Engine:
 
             if self.wandb is not None and video_path is not None and os.path.isfile(video_path):
                 try:
-                    self.wandb.log({
-                        f"Test/tracking/{seq_name}_video": wandb.Video(
-                            video_path, fps=max(fps, 4), format="mp4"
-                        )
-                    })
+                    self.wandb.log(
+                        {
+                            f"Test/tracking/{seq_name}_video": wandb.Video(
+                                video_path, fps=max(fps, 4), format="mp4"
+                            ),
+                            **self._wandb_test_eval_step_dict(),
+                        }
+                    )
                 except Exception as e:
                     self.logger.info(
                         f"  wandb.Video upload failed for {seq_name}: {e}",
@@ -1189,11 +1250,14 @@ class Engine:
                 )
 
                 if self.wandb is not None:
-                    self.wandb.log({
-                        f"Test/tracking/{seq_name}/delta_avg": results["delta_avg"],
-                        f"Test/tracking/{seq_name}/OA": results["OA"],
-                        f"Test/tracking/{seq_name}/AJ": results["AJ"],
-                    })
+                    self.wandb.log(
+                        {
+                            f"Test/tracking/{seq_name}/delta_avg": results["delta_avg"],
+                            f"Test/tracking/{seq_name}/OA": results["OA"],
+                            f"Test/tracking/{seq_name}/AJ": results["AJ"],
+                            **self._wandb_test_eval_step_dict(),
+                        }
+                    )
 
                 pixel_errors = (pred_tracks - gt_tracks).norm(dim=-1)  # [N_pts, T_pred]
 
@@ -1230,11 +1294,14 @@ class Engine:
                     and os.path.isfile(cmp_video_path)
                 ):
                     try:
-                        self.wandb.log({
-                            f"Test/tracking/{seq_name}_gt_vs_pred": wandb.Video(
-                                cmp_video_path, fps=max(fps, 4), format="mp4"
-                            )
-                        })
+                        self.wandb.log(
+                            {
+                                f"Test/tracking/{seq_name}_gt_vs_pred": wandb.Video(
+                                    cmp_video_path, fps=max(fps, 4), format="mp4"
+                                ),
+                                **self._wandb_test_eval_step_dict(),
+                            }
+                        )
                     except Exception as e:
                         self.logger.info(
                             f"  wandb.Video upload failed for comparison {seq_name}: {e}",
@@ -1268,11 +1335,14 @@ class Engine:
             )
 
             if self.wandb is not None:
-                self.wandb.log({
-                    "Test/tracking/mean_delta_avg": mean_delta,
-                    "Test/tracking/mean_OA": mean_oa,
-                    "Test/tracking/mean_AJ": mean_aj,
-                })
+                self.wandb.log(
+                    {
+                        "Test/tracking/mean_delta_avg": mean_delta,
+                        "Test/tracking/mean_OA": mean_oa,
+                        "Test/tracking/mean_AJ": mean_aj,
+                        **self._wandb_test_eval_step_dict(),
+                    }
+                )
 
                 tracking_table = wandb.Table(
                     columns=["sequence", "delta_avg", "OA", "AJ"],
@@ -1281,7 +1351,9 @@ class Engine:
                         for m in seqs_with_metrics
                     ],
                 )
-                self.wandb.log({"Test/tracking/summary": tracking_table})
+                self.wandb.log(
+                    {"Test/tracking/summary": tracking_table, **self._wandb_test_eval_step_dict()}
+                )
                 del tracking_table
 
             tracking_csv_path = os.path.join(tracking_dir, "tracking_metrics.csv")
@@ -1297,13 +1369,22 @@ class Engine:
         """
 
         self.logger.info(">> TEST REPORT", context="TEST")
-        test_describe = self.metrics["Test"].describe().to_string()
-        self.logger.info("\n" + test_describe, context="TEST")
-        del test_describe
-        self.metrics["Test"].to_csv(self.TEST_DIR + "/test_metrics.csv")
-        test_table = wandb.Table(dataframe=self.metrics["Test"])
-        self.wandb.log({"Test/Summary": test_table})
-        del test_table
+        test_df = self.metrics["Test"]
+        if len(test_df.columns) == 0 or len(test_df) == 0:
+            self.logger.info(
+                "No pairwise Test-phase metrics (empty frame; e.g. PHASE=tracking skips "
+                "``run_epoch(Test)``). Tracking summaries are logged separately.",
+                context="TEST",
+            )
+        else:
+            test_describe = test_df.describe().to_string()
+            self.logger.info("\n" + test_describe, context="TEST")
+            del test_describe
+        test_df.to_csv(self.TEST_DIR + "/test_metrics.csv")
+        if self.wandb is not None and len(test_df.columns) > 0 and len(test_df) > 0:
+            test_table = wandb.Table(dataframe=test_df)
+            self.wandb.log({"Test/Summary": test_table, **self._wandb_test_eval_step_dict()})
+            del test_table
 
         self.logger.info(">> RUN DATA LOCATIONS", context="SAVE")
         self.logger.info(
@@ -1345,6 +1426,8 @@ class Engine:
         """
         Save training and validation metrics to CSV files.
         """
+        if not is_main_process():
+            return
 
         if self.metrics["Training"] is not None:
             self.metrics["Training"].to_csv(
@@ -1365,7 +1448,7 @@ class Engine:
         """
         metrics = {}
 
-        diagnostics = getattr(self.matcher.model, "latest_diagnostics", {})
+        diagnostics = getattr(unwrap_model(self.matcher.model), "latest_diagnostics", {})
         source_diag = diagnostics.get("source") if diagnostics is not None else None
         target_diag = diagnostics.get("target") if diagnostics is not None else None
 
@@ -1515,7 +1598,7 @@ class Engine:
         """
         Build visual evidence for the utility of hierarchical fusion and confidence weighting.
         """
-        diagnostics = getattr(self.matcher.model, "latest_diagnostics", {})
+        diagnostics = getattr(unwrap_model(self.matcher.model), "latest_diagnostics", {})
         source_diag = diagnostics.get("source") if diagnostics is not None else None
         target_diag = diagnostics.get("target") if diagnostics is not None else None
 
@@ -1884,7 +1967,7 @@ class Engine:
         if pretrained_ckpt:
             resolved = self._resolve_pretrained_checkpoint_path(pretrained_ckpt)
             if resolved:
-                self.matcher.model.fromArtifact(pth_namestring=resolved)
+                unwrap_model(self.matcher.model).fromArtifact(pth_namestring=resolved)
                 self.logger.info(
                     f"Loaded pretrained descriptors from: {resolved}",
                     context="TRACKING",
@@ -1896,6 +1979,14 @@ class Engine:
 
         self.temporal_tracker._freeze_matcher_params()
         self.temporal_tracker.refinement_net.to(self.device)
+        if is_ddp_enabled(self.config):
+            lr = int(self.config.get("LOCAL_RANK", 0))
+            self.temporal_tracker.refinement_net = nn.parallel.DistributedDataParallel(
+                self.temporal_tracker.refinement_net,
+                device_ids=[lr],
+                output_device=lr,
+                find_unused_parameters=True,
+            )
 
         lr_temporal = float(
             self.config.get(
@@ -1907,6 +1998,33 @@ class Engine:
             self.temporal_tracker.refinement_net.parameters(),
             lr=lr_temporal,
             weight_decay=float(self.config.get("WEIGHT_DECAY", 0)),
+        )
+
+        # The descriptor-stage LR schedulers (``self.LRscheduler`` /
+        # ``self.LRschedulerPlateau``) are bound to ``self.optimizer`` (the
+        # frozen matcher's optimizer) and therefore never affected the
+        # refinement net. Build a dedicated cosine scheduler on the tracking
+        # optimizer so the LR actually decays during PHASE=tracking.
+        epochs = max(1, int(self.config.get("EPOCHS", 1)))
+        eta_min = float(
+            self.config.get(
+                "LR_TEMPORAL_REFINEMENT_MIN",
+                lr_temporal * 1e-2,
+            )
+        )
+        self.tracking_lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.tracking_optimizer,
+            T_max=epochs,
+            eta_min=eta_min,
+        )
+
+        # Must not use ``self.earlystopping`` here: that writes ``{runname}_checkpoint.pth``,
+        # which ``fromArtifact`` / ``reinstantiate_model_from_checkpoint`` treat as the full
+        # matcher. Save refinement-only checkpoints under a distinct basename instead.
+        self.tracking_earlystopping = initialize.earlystopping(
+            self.earlystopping_patience,
+            self.MODELS_DIR,
+            f"{self.runname}_tracking_refinement",
         )
 
         from gatetracker.data import SequenceWindowDataset
@@ -1951,11 +2069,12 @@ class Engine:
                 break
 
         tracking_ckpt_path = os.path.join(self.MODELS_DIR, "tracking_refinement_net.pt")
-        torch.save(
-            self.temporal_tracker.refinement_net.state_dict(),
-            tracking_ckpt_path,
-        )
-        self.logger.info(f"Saved tracking refinement network: {tracking_ckpt_path}", context="SAVE")
+        if is_main_process():
+            torch.save(
+                unwrap_model(self.temporal_tracker.refinement_net).state_dict(),
+                tracking_ckpt_path,
+            )
+            self.logger.info(f"Saved tracking refinement network: {tracking_ckpt_path}", context="SAVE")
         self.logger.info("TRACKING TRAINING COMPLETE", context="SAVE")
 
     def _run_tracking_epoch(self, phase: str = "Training", epoch: int = 0) -> str:
@@ -1986,19 +2105,43 @@ class Engine:
             frames = torch.stack([b["frames"] for b in batch], dim=0)  # [B, T, 3, H, W]
             return {"frames": frames}
 
+        from torch.utils.data.distributed import DistributedSampler
+
         tracking_batch_size = int(self.config.get("TRACKING_BATCH_SIZE", max(1, self.batch_size)))
         num_workers = int(self.config.get("TRACKING_WORKERS", max(4, self.config.WORKERS)))
-        dataloader = torch.utils.data.DataLoader(
-            seq_ds,
-            batch_size=tracking_batch_size,
-            num_workers=num_workers,
-            drop_last=True,
-            collate_fn=tracking_collate_fn,
-            shuffle=TRAINING,
-            pin_memory=True,
-            prefetch_factor=2 if num_workers > 0 else None,
-            persistent_workers=num_workers > 0,
-        )
+        if is_ddp_enabled(self.config):
+            _samp = DistributedSampler(
+                seq_ds,
+                num_replicas=int(self.config.get("WORLD_SIZE", 1)),
+                rank=int(self.config.get("RANK", 0)),
+                shuffle=TRAINING,
+                drop_last=True,
+            )
+            _samp.set_epoch(int(epoch))
+            dataloader = torch.utils.data.DataLoader(
+                seq_ds,
+                batch_size=tracking_batch_size,
+                num_workers=num_workers,
+                drop_last=True,
+                collate_fn=tracking_collate_fn,
+                shuffle=False,
+                sampler=_samp,
+                pin_memory=True,
+                prefetch_factor=2 if num_workers > 0 else None,
+                persistent_workers=num_workers > 0,
+            )
+        else:
+            dataloader = torch.utils.data.DataLoader(
+                seq_ds,
+                batch_size=tracking_batch_size,
+                num_workers=num_workers,
+                drop_last=True,
+                collate_fn=tracking_collate_fn,
+                shuffle=TRAINING,
+                pin_memory=True,
+                prefetch_factor=2 if num_workers > 0 else None,
+                persistent_workers=num_workers > 0,
+            )
 
         if len(dataloader) == 0:
             if not TRAINING:
@@ -2036,16 +2179,9 @@ class Engine:
                 metrics = {f"{phase}/tracking/{k}": v for k, v in loss_dict["metrics"].items()}
                 metrics[f"Step/{'epoch' if phase == 'Training' else 'val_epoch'}"] = epoch
                 metrics["Loss"] = loss_total.item()
-                m = loss_dict["metrics"]
-                metrics["Cycle"] = m.get("loss_cycle", 0.0)
-                metrics["Smooth"] = m.get("loss_smooth", 0.0)
-                metrics["Desc"] = m.get("loss_desc", 0.0)
-                metrics["Feat"] = m.get("loss_feat", 0.0)
-                metrics["VisReg"] = m.get("loss_vis", m.get("loss_vis_reg", 0.0))
-                metrics["SupPos"] = m.get("loss_sup_pos", 0.0)
-                metrics["SupVis"] = m.get("loss_sup_vis", 0.0)
-                metrics["PseudoLam"] = m.get("pseudo_lambda", 0.0)
-                metrics["PseudoOn"] = m.get("pseudo_gt_active", 0.0)
+                metrics[f"{phase}/optim/LR_temporal"] = float(
+                    self.tracking_optimizer.param_groups[0]["lr"]
+                )
 
                 new_row = pd.DataFrame([metrics])
                 self.metrics[phase] = pd.concat(
@@ -2061,10 +2197,6 @@ class Engine:
                     metrics=metrics,
                 )
 
-                if self.wandb is not None and batch_idx % self.logfreq_wandb == 0:
-                    wandb_metrics = {k: v for k, v in metrics.items() if v is not None}
-                    self.wandb.log(wandb_metrics)
-
                 del frames, loss_dict, loss_total
                 torch.cuda.empty_cache()
 
@@ -2072,19 +2204,31 @@ class Engine:
             self._tracking_validate_stereomis_gt(epoch)
 
         if epoch_losses:
-            mean_loss = np.mean(epoch_losses)
+            _sum = float(np.sum(epoch_losses))
+            _cnt = float(len(epoch_losses))
+            if is_ddp_enabled(self.config):
+                _sum, _cnt = all_reduce_sum_scalars(_sum, _cnt, self.device)
+            mean_loss = _sum / max(_cnt, 1.0)
             self.logger.info(
                 f">> {phase} epoch {epoch+1} mean loss: {mean_loss:.4f}",
                 context="TRACKING",
             )
             if self.wandb is not None:
-                self.wandb.log({f"{phase}/tracking/epoch_loss": mean_loss})
+                self.wandb.log(
+                    {
+                        f"{phase}/tracking/epoch_loss": mean_loss,
+                        **self._wandb_epoch_axis_dict(epoch),
+                    }
+                )
 
             if not TRAINING:
                 self.step["epoch"] += 1
-                if self.LRschedulerPlateau is not None:
-                    self.LRschedulerPlateau.step(mean_loss)
-                should_stop = self.earlystopping(
+                # Step the tracking-optimizer scheduler at epoch granularity.
+                # ``self.LRschedulerPlateau`` is bound to the descriptor
+                # optimizer (frozen here) and is intentionally not stepped.
+                if getattr(self, "tracking_lr_scheduler", None) is not None:
+                    self.tracking_lr_scheduler.step()
+                should_stop = self.tracking_earlystopping(
                     mean_loss, self.temporal_tracker.refinement_net, epoch,
                 )
                 if should_stop:
@@ -2106,6 +2250,8 @@ class Engine:
             return
         if not hasattr(self, "temporal_tracker") or self.temporal_tracker is None:
             return
+        if is_ddp_enabled(self.config) and not is_main_process():
+            return
 
         from gatetracker.data import StereoMISTracking
         from gatetracker.tracking.metrics import compute_tap_metrics
@@ -2125,11 +2271,9 @@ class Engine:
             return
 
         config_path = stereomis_config.get("PATH", "StereoMIS_Tracking")
-        dataset_rootdir = os.environ.get("DATASET_ROOTDIR")
-        if dataset_rootdir and not os.path.isabs(config_path):
-            root = os.path.join(dataset_rootdir, config_path)
-        else:
-            root = config_path
+        root = resolve_dataset_filesystem_path(config_path, "STEREOMIS")
+        if root is None:
+            root = os.path.expandvars(os.path.expanduser(str(config_path)))
 
         seq_name = str(self.config.get("TRACKING_STEREOMIS_VAL_SEQUENCE", "test_P3_1"))
         seq_dir = os.path.join(root, seq_name)
@@ -2246,11 +2390,11 @@ class Engine:
             context="TRACKING",
         )
 
-        wb_step = epoch
         log_payload: Dict[str, Any] = {
             f"{prefix}/{seq_name}/delta_avg": results["delta_avg"],
             f"{prefix}/{seq_name}/OA": results["OA"],
             f"{prefix}/{seq_name}/AJ": results["AJ"],
+            **self._wandb_epoch_axis_dict(epoch),
         }
 
         grid_path = os.path.join(out_dir, f"{seq_name}_grid_ep{epoch:04d}.mp4")
@@ -2310,7 +2454,7 @@ class Engine:
                     log_payload[f"{prefix}/gt_vs_pred_video"] = wandb.Video(
                         cmp_path, fps=max(fps, 4), format="mp4"
                     )
-                self.wandb.log(log_payload, step=wb_step)
+                self.wandb.log(log_payload)
             except Exception as e:
                 self.logger.warning(
                     f"TRACKING_STEREOMIS_VAL: wandb log failed: {e}",
@@ -2331,17 +2475,31 @@ class Engine:
         """
         if path is None:
             path = os.path.join(self.MODELS_DIR, "descriptors_pretrained.pt")
-        return self.matcher.model.save_pretrained_descriptors(path)
+        return unwrap_model(self.matcher.model).save_pretrained_descriptors(path)
 
     def reinstantiate_model_from_checkpoint(self) -> None:
         """
         Reinstantiate the model from the latest checkpoint saved.
         """
+        from gatetracker.distributed_context import unwrap_model
+
+        if normalize_pipeline_phase(self.config) == "tracking":
+            self.logger.info(
+                "Skipping matcher reinstantiation for PHASE=tracking (descriptor weights "
+                "unchanged on disk here; refinement is in "
+                f"{self.runname}_tracking_refinement_checkpoint.pth and "
+                "tracking_refinement_net.pt).",
+                context="GCLOUD",
+            )
+            return
         self.logger.info(
             f"Attempting reinstatiation from checkpoint @ {self.MODELS_DIR}",
             context="GCLOUD",
         )
-        self.matcher.model.fromArtifact(model_name=self.runname, local_path=self.MODELS_DIR)
+        inner = unwrap_model(self.matcher.model)
+        inner.fromArtifact(model_name=self.runname, local_path=self.MODELS_DIR)
+        self.matcher.model = inner
+        self._wrap_matcher_parallel()
         self.logger.info(
             f"Model reinstantiated from checkpoint @ {self.runname}",
             context="GCLOUD",

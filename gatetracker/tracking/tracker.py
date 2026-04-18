@@ -7,7 +7,19 @@ The tracker follows a two-stage TAPIR-style pipeline:
   Stage 1: Global coarse matching using pretrained descriptors (no new params).
   Stage 2: Iterative temporal refinement using local correlation + temporal
            convolutions (trainable TemporalRefinementNetwork).
+
+Long-horizon design notes
+-------------------------
+``track_long_sequence`` anchors every sliding window to the **original** query
+descriptor and the **original** fine feature sampled at frame 0 of the global
+sequence. Without this anchor, each new window re-samples the descriptor at the
+(already-drifting) tracked position — descriptor drift then accumulates linearly
+with the number of windows, which is fatal beyond a few dozen frames. The
+backbone is also encoded only once for the whole sequence and sliced per window,
+so the cost of long inference is linear in T_total rather than ~2× redundant.
 """
+
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -34,11 +46,13 @@ class TemporalTracker(nn.Module):
         matcher: Matcher,
         refinement_net: TemporalRefinementNetwork,
         freeze_matcher: bool = True,
+        encoder_chunk_size: int = 16,
     ):
         super().__init__()
         self.matcher = matcher
         self.refinement_net = refinement_net
         self._freeze_matcher = freeze_matcher
+        self.encoder_chunk_size = max(1, int(encoder_chunk_size))
 
         if freeze_matcher:
             self._freeze_matcher_params()
@@ -63,9 +77,21 @@ class TemporalTracker(nn.Module):
             TEMPORAL_REFINEMENT_NUM_ITERS  (4)
             TEMPORAL_REFINEMENT_CORR_RADIUS (3)
             TEMPORAL_REFINEMENT_KERNEL_SIZE (5)
+            TEMPORAL_REFINEMENT_SOFTMAX_TEMPERATURE
+                (falls back to FINE_REFINEMENT_TEMPERATURE, then 0.1)
+            TRACKING_ENCODER_CHUNK_SIZE (16)
+                Max frames per backbone forward pass in ``_encode_all_frames``.
+                Increasing this raises GPU utilization during feature extraction.
             FINE_REFINEMENT_DIM (64)
         """
         feature_dim = int(config.get("FINE_REFINEMENT_DIM", 64))
+        softmax_temperature = float(
+            config.get(
+                "TEMPORAL_REFINEMENT_SOFTMAX_TEMPERATURE",
+                config.get("FINE_REFINEMENT_TEMPERATURE", 0.1),
+            )
+        )
+        encoder_chunk_size = int(config.get("TRACKING_ENCODER_CHUNK_SIZE", 16))
         refinement_net = TemporalRefinementNetwork(
             feature_dim=feature_dim,
             hidden_dim=int(config.get("TEMPORAL_REFINEMENT_HIDDEN_DIM", 128)),
@@ -73,15 +99,21 @@ class TemporalTracker(nn.Module):
             num_iters=int(config.get("TEMPORAL_REFINEMENT_NUM_ITERS", 4)),
             corr_radius=int(config.get("TEMPORAL_REFINEMENT_CORR_RADIUS", 3)),
             kernel_size=int(config.get("TEMPORAL_REFINEMENT_KERNEL_SIZE", 5)),
+            softmax_temperature=softmax_temperature,
         ).to(matcher.device)
 
-        return TemporalTracker(matcher, refinement_net, freeze_matcher=True)
+        return TemporalTracker(
+            matcher,
+            refinement_net,
+            freeze_matcher=True,
+            encoder_chunk_size=encoder_chunk_size,
+        )
 
     # ------------------------------------------------------------------
     # Feature extraction helpers (frozen backbone)
     # ------------------------------------------------------------------
 
-    def _encode_all_frames(self, frames: torch.Tensor, chunk_size: int = 16):
+    def _encode_all_frames(self, frames: torch.Tensor, chunk_size: int | None = None):
         """Encode all frames in a window through the frozen backbone.
 
         Processes frames in chunks of ``chunk_size`` to avoid OOM while
@@ -89,12 +121,18 @@ class TemporalTracker(nn.Module):
 
         Args:
             frames:     [B, T, 3, H, W]
-            chunk_size: Max images per backbone forward pass.
+            chunk_size: Max images per backbone forward pass. When ``None``,
+                falls back to ``self.encoder_chunk_size`` (set via the
+                ``TRACKING_ENCODER_CHUNK_SIZE`` config key).
 
         Returns:
             descriptor_maps: list of T tensors [B, C, H_p, W_p]
             fine_feature_maps: [B, T, C_f, H_f, W_f] or None
         """
+        if chunk_size is None:
+            chunk_size = self.encoder_chunk_size
+        chunk_size = max(1, int(chunk_size))
+
         B, T = frames.shape[:2]
         flat_frames = frames.reshape(B * T, *frames.shape[2:])  # [B*T, 3, H, W]
         N_total = B * T
@@ -136,12 +174,20 @@ class TemporalTracker(nn.Module):
         self,
         query_points: torch.Tensor,
         descriptor_maps: list[torch.Tensor],
+        query_descriptors: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Match query descriptors from t=0 to every frame independently.
+        """Match query descriptors against every frame independently.
 
         Args:
-            query_points:   [B, Q, 2] positions at frame 0.
-            descriptor_maps: list of T tensors [B, C, H_p, W_p].
+            query_points:      [B, Q, 2] positions at the **anchor** frame
+                (used only when ``query_descriptors`` is None).
+            descriptor_maps:   list of T tensors [B, C, H_p, W_p].
+            query_descriptors: Optional [B, Q, C] L2-normalised query
+                descriptors. When provided, they are used directly so the
+                anchor descriptor stays consistent across long horizons
+                (see ``track_long_sequence``). When ``None`` the descriptor
+                is sampled from ``descriptor_maps[0]`` at ``query_points``
+                (legacy single-window behaviour).
 
         Returns:
             coarse_tracks: [B, Q, T, 2] patch-center coordinates.
@@ -149,10 +195,12 @@ class TemporalTracker(nn.Module):
         patch_size = self.matcher.patch_size
         T = len(descriptor_maps)
 
-        # Extract query descriptors from frame 0
-        query_desc = correspondence.sample_embeddings_at_points(
-            descriptor_maps[0], query_points, patch_size,
-        )  # [B, Q, C]
+        if query_descriptors is None:
+            query_desc = correspondence.sample_embeddings_at_points(
+                descriptor_maps[0], query_points, patch_size,
+            )  # [B, Q, C]
+        else:
+            query_desc = query_descriptors  # [B, Q, C]
 
         coarse_positions = []
         for t in range(T):
@@ -174,12 +222,30 @@ class TemporalTracker(nn.Module):
         self,
         query_points: torch.Tensor,
         frames: torch.Tensor,
+        query_descriptors: Optional[torch.Tensor] = None,
+        query_features: Optional[torch.Tensor] = None,
+        descriptor_maps: Optional[list[torch.Tensor]] = None,
+        fine_feature_maps: Optional[torch.Tensor] = None,
     ) -> dict:
         """Track query points across a temporal window.
 
         Args:
-            query_points: [B, Q, 2] pixel coordinates at frame 0.
-            frames:       [B, T, 3, H, W] frame window.
+            query_points: [B, Q, 2] pixel coordinates at the anchor frame.
+                Used only when the corresponding ``query_*`` argument is None
+                (then descriptors / fine features are sampled at these
+                positions from frame 0 of the window).
+            frames:       [B, T, 3, H, W] frame window. Ignored when both
+                ``descriptor_maps`` and ``fine_feature_maps`` are provided.
+            query_descriptors: Optional [B, Q, C_desc] anchor descriptor
+                used by the global coarse match. Set this to keep the
+                semantic anchor fixed across long horizons.
+            query_features:    Optional [B, Q, C_fine] anchor fine feature
+                used by the temporal refinement correlation. Set this to
+                keep the refinement anchor fixed across long horizons.
+            descriptor_maps:   Optional precomputed list of T tensors
+                [B, C, H_p, W_p]. When provided the backbone is not invoked.
+            fine_feature_maps: Optional precomputed [B, T, C_f, H_f, W_f].
+                When provided the backbone is not invoked.
 
         Returns:
             dict with:
@@ -187,9 +253,12 @@ class TemporalTracker(nn.Module):
                 visibility:   [B, Q, T] visibility logits.
                 coarse_tracks: [B, Q, T, 2] pre-refinement positions.
         """
-        # Stage 1: extract features and global matching
-        descriptor_maps, fine_feature_maps = self._encode_all_frames(frames)
-        coarse_tracks = self._global_coarse_match(query_points, descriptor_maps)
+        if descriptor_maps is None or fine_feature_maps is None:
+            descriptor_maps, fine_feature_maps = self._encode_all_frames(frames)
+
+        coarse_tracks = self._global_coarse_match(
+            query_points, descriptor_maps, query_descriptors=query_descriptors,
+        )  # [B, Q, T, 2]
 
         if fine_feature_maps is None:
             return {
@@ -200,16 +269,15 @@ class TemporalTracker(nn.Module):
                 "coarse_tracks": coarse_tracks,
             }
 
-        # Query fine features at t=0 for the refinement network
         feature_stride = getattr(self.matcher.model, "fine_feature_stride", 4)
-        query_fine = correspondence.sample_embeddings_at_points(
-            fine_feature_maps[:, 0], query_points, feature_stride,
-        )  # [B, Q, C_f]
+        if query_features is None:
+            query_features = correspondence.sample_embeddings_at_points(
+                fine_feature_maps[:, 0], query_points, feature_stride,
+            )  # [B, Q, C_f]
 
-        # Stage 2: iterative temporal refinement
         refined = self.refinement_net(
             coarse_tracks=coarse_tracks,
-            query_features=query_fine,
+            query_features=query_features,
             feature_maps=fine_feature_maps,
             feature_stride=feature_stride,
         )
@@ -229,64 +297,130 @@ class TemporalTracker(nn.Module):
         query_points: torch.Tensor,
         frames: torch.Tensor,
         window_size: int = 16,
+        stride: Optional[int] = None,
+        encoder_chunk_size: Optional[int] = None,
     ) -> dict:
         """Track points across a long sequence using sliding overlapping windows.
 
+        Long-horizon design:
+
+        - The backbone is encoded **once** for the whole sequence and the
+          resulting per-frame descriptor / fine-feature maps are sliced per
+          window. Per-window re-encoding is wasteful and was the dominant
+          cost of the previous implementation.
+        - The **original** query descriptor (coarse) and **original** fine
+          feature (sampled at frame 0 of the global sequence at
+          ``query_points``) are reused for every window. This prevents the
+          slow descriptor drift that is otherwise unavoidable when later
+          windows re-sample their anchor at the already-tracked position.
+        - Per-frame estimates from overlapping windows are aggregated as a
+          visibility-probability-weighted average in probability space; the
+          final visibility is converted back to a logit so downstream
+          consumers (loss / sigmoid > 0.5 thresholding) can keep the same
+          interface.
+
         Args:
-            query_points: [B, Q, 2] initial positions at frame 0.
-            frames:       [B, T_total, 3, H, W] full sequence.
-            window_size:  Temporal window length.
+            query_points:        [B, Q, 2] initial positions at frame 0.
+            frames:              [B, T_total, 3, H, W] full sequence.
+            window_size:         Temporal window length per refinement call.
+            stride:              Window step. Defaults to ``window_size // 2``.
+            encoder_chunk_size:  Override for the per-call backbone chunk
+                size. Defaults to ``self.encoder_chunk_size``.
 
         Returns:
-            dict with tracks [B, Q, T_total, 2] and visibility [B, Q, T_total].
+            dict with tracks [B, Q, T_total, 2] and visibility [B, Q, T_total]
+            (logits, same convention as ``track``).
         """
         B, T_total = frames.shape[:2]
         Q = query_points.shape[1]
         device = frames.device
-        stride = max(1, window_size // 2)
+        if stride is None or stride <= 0:
+            stride = max(1, window_size // 2)
+        stride = int(min(max(stride, 1), window_size))
+
+        descriptor_maps_all, fine_feature_maps_all = self._encode_all_frames(
+            frames, chunk_size=encoder_chunk_size,
+        )
+
+        patch_size = self.matcher.patch_size
+        feature_stride = getattr(self.matcher.model, "fine_feature_stride", 4)
+
+        query_desc_anchor = correspondence.sample_embeddings_at_points(
+            descriptor_maps_all[0], query_points, patch_size,
+        )  # [B, Q, C_desc]
+        if fine_feature_maps_all is not None:
+            query_fine_anchor = correspondence.sample_embeddings_at_points(
+                fine_feature_maps_all[:, 0], query_points, feature_stride,
+            )  # [B, Q, C_fine]
+        else:
+            query_fine_anchor = None
 
         all_tracks = torch.zeros(B, Q, T_total, 2, device=device)
-        all_vis = torch.zeros(B, Q, T_total, device=device)
-        weight_map = torch.zeros(B, Q, T_total, 1, device=device)
+        all_vis_prob = torch.zeros(B, Q, T_total, device=device)
+        weight_map = torch.zeros(B, Q, T_total, device=device)
 
         all_tracks[:, :, 0, :] = query_points
-        weight_map[:, :, 0, :] = 1.0
+        all_vis_prob[:, :, 0] = 1.0
+        weight_map[:, :, 0] = 1.0
 
         for w_start in range(0, T_total - 1, stride):
             w_end = min(w_start + window_size, T_total)
             if w_end - w_start < 2:
                 break
 
-            window_frames = frames[:, w_start:w_end]  # [B, T_w, 3, H, W]
-
-            if w_start == 0:
-                qp = query_points
-            else:
-                qp = all_tracks[:, :, w_start, :]
+            window_descs = descriptor_maps_all[w_start:w_end]
+            window_fine = (
+                fine_feature_maps_all[:, w_start:w_end]
+                if fine_feature_maps_all is not None
+                else None
+            )
 
             with torch.no_grad():
-                out = self.track(qp, window_frames)
+                out = self.track(
+                    query_points=query_points,
+                    frames=frames[:, w_start:w_end],  # ignored (caches provided)
+                    query_descriptors=query_desc_anchor,
+                    query_features=query_fine_anchor,
+                    descriptor_maps=window_descs,
+                    fine_feature_maps=window_fine,
+                )
 
             window_tracks = out["tracks"]  # [B, Q, T_w, 2]
-            vis = out["visibility"]  # [B, Q, T_w]
-            conf = torch.sigmoid(vis).unsqueeze(-1)  # [B, Q, T_w, 1]
+            window_vis = out["visibility"]  # [B, Q, T_w] logits
+            window_prob = torch.sigmoid(window_vis)  # [B, Q, T_w]
 
-            for local_t in range(w_end - w_start):
-                global_t = w_start + local_t
-                w = conf[:, :, local_t, :]  # [B, Q, 1]
-                all_tracks[:, :, global_t, :] = (
-                    all_tracks[:, :, global_t, :] * weight_map[:, :, global_t, :]
-                    + window_tracks[:, :, local_t, :] * w
-                ) / (weight_map[:, :, global_t, :] + w).clamp_min(1e-6)
-                all_vis[:, :, global_t] = (
-                    all_vis[:, :, global_t] * weight_map[:, :, global_t, 0]
-                    + vis[:, :, local_t] * w.squeeze(-1)
-                ) / (weight_map[:, :, global_t, 0] + w.squeeze(-1)).clamp_min(1e-6)
-                weight_map[:, :, global_t, :] += w
+            local_idx = torch.arange(w_end - w_start, device=device)
+            global_idx = w_start + local_idx  # [T_w]
+
+            cur_w = weight_map[:, :, global_idx]  # [B, Q, T_w]
+            new_w = window_prob  # [B, Q, T_w]
+            denom = (cur_w + new_w).clamp_min(1e-6)
+
+            all_tracks[:, :, global_idx, :] = (
+                all_tracks[:, :, global_idx, :] * cur_w.unsqueeze(-1)
+                + window_tracks * new_w.unsqueeze(-1)
+            ) / denom.unsqueeze(-1)
+            all_vis_prob[:, :, global_idx] = (
+                all_vis_prob[:, :, global_idx] * cur_w
+                + window_prob * new_w
+            ) / denom
+            weight_map[:, :, global_idx] = cur_w + new_w
+
+        # Anchor the global frame 0 exactly at the user-provided query
+        # locations: the refinement net's soft-argmax can otherwise drift the
+        # anchor by sub-pixel amounts and that is visually distracting in the
+        # rendered tracks video.
+        all_tracks[:, :, 0, :] = query_points
+
+        # Convert aggregated probabilities back to logits for downstream
+        # consumers that expect ``visibility`` in logit space.
+        eps = 1e-6
+        p = all_vis_prob.clamp(eps, 1.0 - eps)
+        all_vis_logits = torch.log(p / (1.0 - p))
 
         return {
-            "tracks": all_tracks,       # [B, Q, T_total, 2]
-            "visibility": all_vis,      # [B, Q, T_total]
+            "tracks": all_tracks,         # [B, Q, T_total, 2]
+            "visibility": all_vis_logits,  # [B, Q, T_total] logits
         }
 
     # ------------------------------------------------------------------

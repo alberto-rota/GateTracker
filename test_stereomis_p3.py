@@ -8,7 +8,12 @@ an MP4 with trajectory overlays.
 
 import argparse
 import os
+import sys
 from pathlib import Path
+
+_REPO = os.path.dirname(os.path.abspath(__file__))
+if _REPO not in sys.path:
+    sys.path.insert(0, _REPO)
 
 import torch
 import yaml
@@ -34,7 +39,7 @@ def load_config(config_path: str) -> DotMap:
     return DotMap(config_dict)
 
 
-def resolve_checkpoint_path(checkpoint_ref: str, runs_dir: str = "runs") -> str | None:
+def resolve_checkpoint_path(checkpoint_ref: str, runs_dir: str | None = None) -> str | None:
     if checkpoint_ref is None:
         return None
     checkpoint_ref = checkpoint_ref.strip()
@@ -45,25 +50,26 @@ def resolve_checkpoint_path(checkpoint_ref: str, runs_dir: str = "runs") -> str 
     if os.path.isfile(expanded):
         return expanded
 
-    looks_like_run_name = (os.sep not in checkpoint_ref) and (
-        os.path.splitext(checkpoint_ref)[1] == ""
+    from gatetracker.env_bootstrap import (
+        pretrained_checkpoint_path_candidates,
+        results_dir_default,
     )
-    if not looks_like_run_name:
-        return None
 
-    candidate_paths = [
-        os.path.join(runs_dir, checkpoint_ref, "models", f"{checkpoint_ref}_checkpoint.pth"),
-        os.path.join(runs_dir, checkpoint_ref, "checkpoints", "weights_best.pt"),
-        os.path.join("checkpoints", f"{checkpoint_ref}_checkpoint.pth"),
-        os.path.join("checkpoints", f"{checkpoint_ref}.pt"),
-    ]
-    for candidate in candidate_paths:
+    package_fallback = os.path.normpath(os.path.join(_REPO, "gatetracker", "runs"))
+    runs_effective = runs_dir or results_dir_default(package_runs_fallback=package_fallback)
+    for candidate in pretrained_checkpoint_path_candidates(
+        checkpoint_ref, runs_dir=runs_effective
+    ):
         if os.path.isfile(candidate):
             return candidate
     return None
 
 
 def main():
+    from gatetracker.env_bootstrap import require_dotenv_before_pipeline
+
+    require_dotenv_before_pipeline(purpose="StereoMIS tracking or evaluation")
+
     parser = argparse.ArgumentParser(description="StereoMIS P3 tracking demo (10x10 grid, 10 seconds).")
     parser.add_argument("--config", type=str, default="config_test.yaml")
     parser.add_argument("--root", type=str, default="/home/shared/nearmrs/arota/StereoMIS_Tracking")

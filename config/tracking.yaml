@@ -17,7 +17,7 @@ parameters:
   FROM_PRETRAINED_CHECKPOINT:
     value: ""
   PRETRAINED_DESCRIPTOR_CKPT:
-    value: "feasible-glitter-797"
+    value: "swept-cloud-14"
 
   # ===== DATA =====
   IMAGE_HEIGHT:
@@ -26,6 +26,12 @@ parameters:
     value: 448
   BATCH_SIZE:
     value: 16
+  DISTRIBUTE:
+    value: "singlegpu"
+  DISTBACKEND:
+    value: "nccl"
+  DDP_SHUFFLE_SEED:
+    value: 978654321
   SHUFFLE:
     value: True
   WORKERS:
@@ -41,7 +47,7 @@ parameters:
   DATASETS:
     value:
       SCARED:
-        PATH: "/home/shared/nearmrs/arota/SCARED"
+        PATH: "SCARED"
         FPS: 16
         FRAMESKIP: [1, 2, 4, 8, 16, 24, 32]
         TRAIN_VIDEOS: ["train_v20*"]
@@ -59,7 +65,7 @@ parameters:
         CROP_ZOOM_FACTOR: 1.0
 
       CHOLEC80:
-        PATH: "/home/shared/nearmrs/arota/CHOLEC80/videos"
+        PATH: "CHOLEC80/videos"
         FPS: 20
         FRAMESKIP: [1]
         TRAIN_VIDEOS: ["train_video02"]
@@ -77,13 +83,13 @@ parameters:
         CROP_ZOOM_FACTOR: 1.2
 
       STEREOMIS:
-        PATH: "/home/shared/nearmrs/arota/StereoMIS_Tracking"
+        PATH: "StereoMIS_Tracking"
         FPS: 4
         FRAMESKIP: [1, 2]
         TRAIN_VAL_SPLIT: 0.7
-        TRAIN_VIDEOS: ["train_*"]
-        VAL_VIDEOS: ["test_*"]
-        TEST_VIDEOS: ["test_*"]
+        TRAIN_VIDEOS: [""]
+        VAL_VIDEOS: ["test_P3_1"]
+        TEST_VIDEOS: ["test_P3_1"]
         RANDOM_POSE_TRAINING: True
         RANDOM_POSE_RANGES: [2.5, 3.25]
         CURRICULUM_FACTOR: 1
@@ -97,7 +103,7 @@ parameters:
 
   # ===== BACKBONE =====
   DINO_MODEL_NAME:
-    value: "facebook/dinov3-vitb16-pretrain-lvd1689m"
+    value: "facebook/dinov3-vitl16-pretrain-lvd1689m"
   DINO_LAYERS:
     value: "all"
 
@@ -227,6 +233,72 @@ parameters:
   MODEL_WATCHER_FREQ_WANDB:
     value: 5
 
+  # ===== TRACKING TRAIN-TIME SIZING =====
+  # Train-time memory scales as O(B * Q * T * H * N_blocks * N_iters) for the
+  # refinement net activations (the backbone is frozen so encoding is
+  # no_grad), plus a second forward+backward pass for the cycle-loss reverse
+  # tracking. The previous setting (B=32, T=24, Q=1024, iters=6) overflowed
+  # 48-80 GB; these values are tuned to fit a single A40 48GB while keeping
+  # the long-horizon learning signal strong. The *architecture* (hidden dim,
+  # blocks, corr radius, kernel) is kept at long-horizon values below --
+  # raise these train-time knobs back up on an 80 GB card while watching
+  # nvidia-smi. Inference uses ``TemporalTracker.track_long_sequence`` with
+  # sliding windows anchored to the **original** query descriptor, so test-
+  # time horizon is not bounded by ``TRACKING_SEQUENCE_LENGTH``.
+  TRACKING_BATCH_SIZE:
+    value: 16
+  TRACKING_SEQUENCE_LENGTH:
+    value: 16
+  TRACKING_NUM_QUERY_POINTS:
+    value: 512
+  TRACKING_WORKERS:
+    value: 8
+  TRACKING_ENCODER_CHUNK_SIZE:
+    value: 16
+
+  # ===== TEMPORAL REFINEMENT NETWORK (architecture) =====
+  # Sized for long-horizon reasoning: a 9x9 local correlation window
+  # (CORR_RADIUS=4) plus a 7-tap depthwise temporal kernel at H=192 with
+  # 6 mixer blocks. ``NUM_ITERS=4`` balances refinement depth against
+  # per-iter activation storage; training with 4 iters still generalises
+  # to running with more iters at inference (each iter shares weights).
+  TEMPORAL_REFINEMENT_HIDDEN_DIM:
+    value: 192
+  TEMPORAL_REFINEMENT_NUM_BLOCKS:
+    value: 6
+  TEMPORAL_REFINEMENT_NUM_ITERS:
+    value: 4
+  TEMPORAL_REFINEMENT_CORR_RADIUS:
+    value: 4
+  TEMPORAL_REFINEMENT_KERNEL_SIZE:
+    value: 7
+  TEMPORAL_REFINEMENT_SOFTMAX_TEMPERATURE:
+    value: 0.07
+
+  # ===== TEMPORAL TRACKING LOSS WEIGHTS =====
+  # ``descriptor`` and ``feature`` losses are the ones that explicitly tie the
+  # tracked location at every frame back to the **original** query descriptor
+  # / fine feature, so they get the highest weight for long-horizon work.
+  TEMPORAL_CYCLE_LOSS_WEIGHT:
+    value: 1.0
+  TEMPORAL_SMOOTHNESS_LOSS_WEIGHT:
+    value: 0.5
+  TEMPORAL_DESC_LOSS_WEIGHT:
+    value: 0.75
+  TEMPORAL_FEATURE_LOSS_WEIGHT:
+    value: 0.75
+  TEMPORAL_VIS_REG_WEIGHT:
+    value: 0.1
+
+  # ===== TRACKING OPTIMIZER =====
+  # ``LEARNING_RATE`` (1e-5) is sized for descriptor pretraining; using it
+  # for the **freshly initialised** refinement net is far too small. Use a
+  # dedicated LR with cosine decay scheduled over EPOCHS.
+  LR_TEMPORAL_REFINEMENT:
+    value: 2.0e-4
+  LR_TEMPORAL_REFINEMENT_MIN:
+    value: 2.0e-6
+
   # ===== STEREOMIS GT VALIDATION (PHASE=tracking, each val epoch) =====
   # Requires DATASETS.STEREOMIS.PATH (and optional DATASET_ROOTDIR) so the root resolves.
   TRACKING_STEREOMIS_VAL:
@@ -236,15 +308,18 @@ parameters:
   TRACKING_STEREOMIS_VAL_MAX_FRAMES:
     value: null
   TRACKING_STEREOMIS_VAL_GRID:
-    value: 10
+    value: 20
 
   # ===== PSEUDO-GT (novel-view) supervision for PHASE=tracking =====
   # Hybrid training: per-step Bernoulli(PSEUDO_GT_MIX) replaces the window with pseudo
   # views; supervised weight ramps to PSEUDO_GT_SUP_LAMBDA_MAX over PSEUDO_GT_CURRICULUM_EPOCHS.
+  # Pseudo-GT is currently the **only** signal that supervises long-horizon
+  # absolute positions (cycle/smoothness/desc losses are local), so it is
+  # weighted significantly stronger than the descriptor-pretrain default.
   PSEUDO_GT_MIX:
-    value: 0.25
+    value: 0.5
   PSEUDO_GT_SUP_LAMBDA_MAX:
-    value: 0.25
+    value: 0.5
   PSEUDO_GT_CURRICULUM_EPOCHS:
     value: 10
   PSEUDO_GT_GRID_SIZE:

@@ -1,4 +1,6 @@
 # -------------------------------------------------------------------------------------------------#
+# Multi-GPU (DDP): torchrun --standalone --nproc_per_node=4 train.py -c pretrain.yaml --ddp
+# Effective batch size ≈ BATCH_SIZE × world_size (each rank uses BATCH_SIZE).
 
 """Copyright (c) 2024 Asensus Surgical"""
 
@@ -6,7 +8,85 @@
 """ Supervision: Uriya Levy, Gal Weizman, Stefano Pomati """
 
 # -------------------------------------------------------------------------------------------------#
-from main import run_pipeline
+
+import argparse
+import os
+import sys
+
+_REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="GateTracker training")
+    parser.add_argument(
+        "-c",
+        "--config",
+        type=str,
+        default=None,
+        help="YAML file under config/ (basename or path), or an absolute path.",
+    )
+    parser.add_argument(
+        "-b",
+        "--boot",
+        action="store_true",
+        help="Minimal smoke-test (tiny batch, no W&B, few frames).",
+    )
+    dist_group = parser.add_mutually_exclusive_group()
+    dist_group.add_argument(
+        "--ddp",
+        action="store_true",
+        help="Force DistributedDataParallel (requires torchrun; overrides DISTRIBUTE in config).",
+    )
+    dist_group.add_argument(
+        "--dp",
+        action="store_true",
+        help="Force DataParallel on multi-GPU (overrides DISTRIBUTE in config).",
+    )
+    dist_group.add_argument(
+        "--single",
+        action="store_true",
+        help="Force single-GPU / non-distributed (overrides DISTRIBUTE).",
+    )
+    dist_group.add_argument(
+        "--singlegpu",
+        action="store_true",
+        help="Alias for --single.",
+    )
+    args, unknown = parser.parse_known_args()
+
+    config_dir = os.path.join(_REPO_ROOT, "config")
+
+    if args.config:
+        from gatetracker.config_interactive import normalize_user_config_path
+
+        config_path = normalize_user_config_path(_REPO_ROOT, args.config)
+    else:
+        from gatetracker.config_interactive import resolve_config_yaml_path_interactive
+
+        config_path = resolve_config_yaml_path_interactive(
+            config_dir, purpose="training"
+        )
+
+    from gatetracker.pipeline import run_pipeline
+
+    distribute_override = None
+    if args.ddp:
+        distribute_override = "ddp"
+    elif args.dp:
+        distribute_override = "dp"
+    elif args.single or args.singlegpu:
+        distribute_override = "singlegpu"
+
+    run_pipeline(
+        "train",
+        config_path=config_path,
+        boot=args.boot,
+        unknown_cli=unknown,
+        distribute_override=distribute_override,
+    )
+
 
 if __name__ == "__main__":
-    run_pipeline(mode="train")
+    main()

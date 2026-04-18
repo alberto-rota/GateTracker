@@ -5,14 +5,14 @@ from __future__ import annotations
 import os
 import sys
 
-# Repo root for `import main` / `gatetracker` when launched as ``python scripts/sweep_agent.py``.
+# Repo root for ``gatetracker`` when launched as ``python scripts/sweep_agent.py``.
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 
 def _wandb_config_to_train_dict() -> dict:
-    """Build the flat config dict ``main.run_pipeline`` expects (same keys as config_train.yaml)."""
+    """Build the flat config dict ``run_pipeline`` expects (same keys as your train YAML)."""
     import wandb
 
     cfg = wandb.config
@@ -26,10 +26,10 @@ def main() -> None:
     install(show_locals=False)
 
     import wandb
-    from main import run_pipeline
+    from gatetracker.pipeline import run_pipeline
 
     with wandb.init():
-        run_pipeline(mode="train", config=_wandb_config_to_train_dict())
+        run_pipeline("train", config_dict=_wandb_config_to_train_dict())
 
 
 if __name__ == "__main__":

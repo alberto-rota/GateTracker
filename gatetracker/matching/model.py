@@ -1,8 +1,10 @@
+import os
+import pickle
+import tempfile
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import os
-import tempfile
 
 from gatetracker.backbone.feature_extractor import FeatureExtractor
 from gatetracker.matching.fusion import (
@@ -16,6 +18,17 @@ from gatetracker.utils.tensor_ops import chw2embedding, embedding2chw
 from utilities.dev_utils import download_from_gcs
 
 logger = get_logger(__name__).set_context("MATCHING")
+
+
+def _load_checkpoint_mapping(path: str, map_location):
+    """Load checkpoint dict; prefer safe unpickling, fall back for legacy NumPy metadata."""
+    try:
+        return torch.load(path, map_location=map_location, weights_only=True)
+    except pickle.UnpicklingError as exc:
+        msg = str(exc)
+        if "Weights only load failed" in msg or "Unsupported global" in msg:
+            return torch.load(path, map_location=map_location, weights_only=False)
+        raise
 
 
 class LocalRefinementFeatureHead(nn.Module):
@@ -507,7 +520,7 @@ class MatcherModel(FeatureExtractor):
                 raise FileNotFoundError(
                     f"Model checkpoint not found at {pth_namestring}"
                 )
-            loaded_dict = torch.load(pth_namestring, map_location=device, weights_only=True)
+            loaded_dict = _load_checkpoint_mapping(pth_namestring, map_location=device)
             if "model_state_dict" in loaded_dict.keys():
                 self._load_checkpoint_state_dict(loaded_dict["model_state_dict"])
             else:
@@ -519,7 +532,7 @@ class MatcherModel(FeatureExtractor):
                 raise FileNotFoundError(
                     f"Model checkpoint not found at {pth_namestring}"
                 )
-            loaded_dict = torch.load(pth_namestring, map_location=device, weights_only=True)
+            loaded_dict = _load_checkpoint_mapping(pth_namestring, map_location=device)
             self._load_checkpoint_state_dict(loaded_dict["model_state_dict"])
 
             if os.path.dirname(pth_namestring) == tempfile.gettempdir():
@@ -550,5 +563,5 @@ class MatcherModel(FeatureExtractor):
                         f"Checked paths: {possible_paths}"
                     )
                 else:
-                    loaded_dict = torch.load(local_path, map_location=device, weights_only=True)
+                    loaded_dict = _load_checkpoint_mapping(local_path, map_location=device)
                     self._load_checkpoint_state_dict(loaded_dict["model_state_dict"])

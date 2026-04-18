@@ -398,15 +398,15 @@ class EarlyStopping:
                 f"Validation loss decreased ({self.best_score:.6f} --> {val_loss:.6f}). Saving model ..."
             )
 
-        # Create checkpoint data
+        # Create checkpoint data (plain Python scalars so torch.load(weights_only=True) works)
         checkpoint = {
-            "epoch": epoch,
+            "epoch": int(epoch),
             "model_state_dict": model.state_dict(),
-            "val_loss": val_loss,
-            "best_score": self.best_score,
-            "counter": self.counter,
-            "hard_counter": self.hard_counter,
-            "best_epoch": self.best_epoch,
+            "val_loss": float(val_loss),
+            "best_score": float(self.best_score) if self.best_score is not None else None,
+            "counter": int(self.counter),
+            "hard_counter": int(self.hard_counter),
+            "best_epoch": int(self.best_epoch),
         }
 
         # Save locally

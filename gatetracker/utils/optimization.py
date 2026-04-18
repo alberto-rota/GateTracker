@@ -392,20 +392,26 @@ class EarlyStopping:
             model: PyTorch model to save
             epoch: Current epoch number
         """
+        from gatetracker.distributed_context import is_main_process, unwrap_model
+
+        if not is_main_process():
+            return
+
         if self.verbose:
             logger.info(
                 f"Validation loss decreased ({self.best_score:.6f} --> {val_loss:.6f}). Saving model ..."
             )
 
-        # Create checkpoint data
+        unwrapped = unwrap_model(model)
+        # Create checkpoint data (plain Python scalars so torch.load(weights_only=True) works)
         checkpoint = {
-            "epoch": epoch,
-            "model_state_dict": model.state_dict(),
-            "val_loss": val_loss,
-            "best_score": self.best_score,
-            "counter": self.counter,
-            "hard_counter": self.hard_counter,
-            "best_epoch": self.best_epoch,
+            "epoch": int(epoch),
+            "model_state_dict": unwrapped.state_dict(),
+            "val_loss": float(val_loss),
+            "best_score": float(self.best_score) if self.best_score is not None else None,
+            "counter": int(self.counter),
+            "hard_counter": int(self.hard_counter),
+            "best_epoch": int(self.best_epoch),
         }
 
         # Save locally
@@ -443,8 +449,10 @@ class EarlyStopping:
             return
 
         try:
+            from gatetracker.distributed_context import unwrap_model
+
             checkpoint = torch.load(checkpoint_path, map_location="cpu")
-            model.load_state_dict(checkpoint["model_state_dict"])
+            unwrap_model(model).load_state_dict(checkpoint["model_state_dict"])
             
             # Restore early stopping state
             self.best_score = checkpoint.get("best_score")

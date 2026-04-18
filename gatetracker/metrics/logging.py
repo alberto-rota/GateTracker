@@ -8,6 +8,7 @@ and Metric is the individual measurement name.
 
 import wandb
 from typing import Dict, Optional, Any
+
 from gatetracker.utils.logger import get_logger
 from gatetracker.utils.formatting import (
     align,
@@ -17,6 +18,75 @@ from gatetracker.utils.formatting import (
 )
 
 logger = get_logger(__name__)
+
+
+def register_wandb_step_axes(wb: Any) -> None:
+    """Register custom W&B x-axes for train/val/test batch counters and epochs.
+
+    Call once immediately after ``wandb.init`` (same process as training). Uses
+    explicit step keys in each ``run.log`` dict so batch vs epoch charts stay
+    aligned (see Weights & Biases customize log axes / ``define_metric`` docs).
+
+    Step keys (logged as scalars alongside metrics):
+        - ``step/train_batch``: monotonic train batch index
+        - ``step/val_batch``: monotonic validation batch index
+        - ``step/test_batch``: monotonic test dataloader batch index
+        - ``step/epoch``: 0-based epoch index for epoch-level summaries
+        - ``step/test_eval``: monotonic index for ``run_tests`` / eval media logs
+    """
+    for axis in (
+        "step/train_batch",
+        "step/val_batch",
+        "step/test_batch",
+        "step/epoch",
+        "step/test_eval",
+    ):
+        wb.define_metric(axis)
+
+    # Epoch aggregates (narrow patterns before broader phase globs)
+    for phase in ("Training", "Validation"):
+        wb.define_metric(f"{phase}/epoch/*", step_metric="step/epoch")
+        wb.define_metric(f"{phase}/epoch/refine/*", step_metric="step/epoch")
+    wb.define_metric("Test/idx/*", step_metric="step/epoch")
+
+    arch_sub = ("gate", "raw", "fused", "confidence")
+    categories = (
+        "loss",
+        "matching",
+        "refinement",
+        "fusion",
+        "tracking",
+        "optim",
+        "misc",
+    )
+    for phase, sm in (
+        ("Training", "step/train_batch"),
+        ("Validation", "step/val_batch"),
+        ("Test", "step/test_batch"),
+    ):
+        for cat in categories:
+            wb.define_metric(f"{phase}/{cat}/*", step_metric=sm)
+        wb.define_metric(f"{phase}/images/*", step_metric=sm)
+        for sub in arch_sub:
+            wb.define_metric(f"{phase}/{sub}/*", step_metric=sm)
+
+    # Legacy / watch: gradient + LR keys not under Phase/Category
+    wb.define_metric("Gradients/*", step_metric="step/train_batch")
+    wb.define_metric("HyperParameters/*", step_metric="step/train_batch")
+
+    # Issues + legacy Step/* (if still present in payloads)
+    wb.define_metric("Step/batch")
+    wb.define_metric("Step/valbatch")
+    wb.define_metric("Step/lossissues")
+    wb.define_metric("Issues/*", step_metric="Step/lossissues")
+
+    # Offline-style test / eval logs (not the per-batch Test dataloader counter).
+    # W&B only allows a single trailing glob ``*`` (no ``*/*``); deeper paths like
+    # ``Test/tracking/<seq>/delta_avg`` still receive ``step/test_eval`` in the
+    # same ``log`` dict but may chart on the default step until flattened.
+    wb.define_metric("Test/tracking/*", step_metric="step/test_eval")
+    wb.define_metric("Test/Summary", step_metric="step/test_eval")
+    wb.define_metric("Validation/stereomis_gt/*", step_metric="step/epoch")
 
 
 METRIC_CATEGORIES = {
@@ -83,22 +153,7 @@ class MetricsLogger:
     @staticmethod
     def define_wandb_metrics():
         """Register metric step associations with W&B. Call once at init."""
-        wandb.define_metric("step/train_batch")
-        wandb.define_metric("step/val_batch")
-        wandb.define_metric("step/test_batch")
-        wandb.define_metric("step/epoch")
-
-        for phase, step in [
-            ("Training", "step/train_batch"),
-            ("Validation", "step/val_batch"),
-            ("Test", "step/test_batch"),
-        ]:
-            for category in ["loss", "matching", "refinement", "fusion", "tracking", "optim"]:
-                wandb.define_metric(f"{phase}/{category}/*", step_metric=step)
-            wandb.define_metric(f"{phase}/images/*", step_metric=step)
-
-        wandb.define_metric("Training/epoch/*", step_metric="step/epoch")
-        wandb.define_metric("Validation/epoch/*", step_metric="step/epoch")
+        register_wandb_step_axes(wandb)
 
     def _categorize_metric(self, key: str) -> str:
         """Map a raw metric name to its category."""
@@ -128,8 +183,14 @@ class MetricsLogger:
         total_batches: int,
         metrics: Dict[str, Any],
         extra_info: Optional[str] = None,
+        tracking_metrics: Optional[Dict[str, Any]] = None,
     ):
-        """Log metrics for a single batch to console and optionally wandb."""
+        """Log metrics for a single batch to console and optionally wandb.
+
+        ``tracking_metrics`` (optional) are logged once under ``{phase}/tracking/*``.
+        Pass them here instead of merging into ``metrics`` before calling, to avoid
+        duplicate W&B rows from a second ``log_tracking`` call.
+        """
         self._step_counters[phase] += 1
 
         run_tag = abbrev_wandb_run_tag(self.run_name)
@@ -156,12 +217,41 @@ class MetricsLogger:
             except (TypeError, ValueError):
                 continue
 
+        if tracking_metrics:
+            for tk, val in tracking_metrics.items():
+                if val is None:
+                    continue
+                try:
+                    lab = abbrev_console_metric_name(str(tk))
+                    metric_parts.append(f"[yellow]{lab}[/yellow]={float(val):.4f}")
+                except (TypeError, ValueError):
+                    continue
+        else:
+            # Temporal / other paths may only pass namespaced ``{phase}/tracking/*`` keys.
+            _tprefix = f"{phase}/tracking/"
+            for key, val in metrics.items():
+                if not isinstance(key, str) or not key.startswith(_tprefix) or val is None:
+                    continue
+                try:
+                    tk = key[len(_tprefix) :]
+                    lab = abbrev_console_metric_name(str(tk))
+                    metric_parts.append(f"[yellow]{lab}[/yellow]={float(val):.4f}")
+                except (TypeError, ValueError):
+                    continue
+
         metrs = " ".join(metric_parts)
         logger.info(prefix + (" " + metrs if metrs else ""), context=phase.upper())
 
         if self.wandb is not None:
             step_key = {"Training": "step/train_batch", "Validation": "step/val_batch", "Test": "step/test_batch"}
             wandb_dict = self._namespace_metrics(phase, metrics)
+            # ``Step/*`` keys are for on-disk CSV alignment only; W&B uses ``step/*`` axes.
+            wandb_dict = {k: v for k, v in wandb_dict.items() if not k.startswith("Step/")}
+            if tracking_metrics:
+                for tk, val in tracking_metrics.items():
+                    if val is None:
+                        continue
+                    wandb_dict[f"{phase}/tracking/{tk}"] = val
             wandb_dict[step_key.get(phase, "step/train_batch")] = self._step_counters[phase]
             self.wandb.log(wandb_dict)
 
@@ -176,25 +266,14 @@ class MetricsLogger:
         """Log visualization images to wandb only (no disk save)."""
         if self.wandb is None:
             return
-        wandb_images = {}
+        step_key = {"Training": "step/train_batch", "Validation": "step/val_batch", "Test": "step/test_batch"}
+        sk = step_key.get(phase, "step/train_batch")
+        wandb_images: Dict[str, Any] = {sk: self._step_counters[phase]}
         for name, img in images.items():
             key = f"{phase}/images/{name}"
-            if hasattr(img, 'save'):
+            if hasattr(img, "save"):
                 wandb_images[key] = wandb.Image(img)
             else:
                 wandb_images[key] = img
         self.wandb.log(wandb_images)
 
-    def log_tracking(self, phase: str, metrics: Dict[str, float]):
-        """Log tracking-specific metrics with dedicated formatting."""
-        parts = []
-        for key in ["cycle_error", "loss_desc", "coarse_to_fine_delta", "confidence_mean", "visibility_ratio", "loss_total"]:
-            val = metrics.get(key)
-            if val is not None:
-                parts.append(f"{key}={val:.4f}")
-        if parts:
-            logger.info(f"[Tracking] {' '.join(parts)}", context=phase.upper())
-
-        if self.wandb is not None:
-            wandb_dict = {f"{phase}/tracking/{k}": v for k, v in metrics.items() if v is not None}
-            self.wandb.log(wandb_dict)

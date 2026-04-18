@@ -75,7 +75,13 @@ class MultiDataset(ConcatDataset):
     This allows seamless access to samples from any dataset using a single index space.
     """
 
-    def __init__(self, set_of_datasets, shuffle=True):
+    def __init__(
+        self,
+        set_of_datasets,
+        shuffle=True,
+        deterministic_combined_shuffle: bool = False,
+        combined_shuffle_seed: int = 978_654_321,
+    ):
         """
         Initialize the MultiDataset.
 
@@ -84,6 +90,9 @@ class MultiDataset(ConcatDataset):
         - **set_of_datasets** (`list`): List of `Mono3D_Dataset` instances to combine.
           All datasets should have compatible output formats and similar configurations.
         - **shuffle** (`bool`): Whether to shuffle the combined sampler. Default: True.
+        - **deterministic_combined_shuffle** (`bool`): If True, combined-index shuffle uses a
+          seeded RNG keyed by ``shuffle_epoch`` (DDP: identical order on every rank).
+        - **combined_shuffle_seed** (`int`): Base seed added to epoch index for deterministic shuffle.
 
         ## Raises
 
@@ -112,6 +121,8 @@ class MultiDataset(ConcatDataset):
         self.numvideos = sum([dataset.numvideos for dataset in set_of_datasets])
         self.numframes = sum([dataset.numframes for dataset in set_of_datasets])
         self.shuffle = shuffle
+        self.deterministic_combined_shuffle = bool(deterministic_combined_shuffle)
+        self.combined_shuffle_seed = int(combined_shuffle_seed)
 
         # Calculate proportion of videos and frames from each dataset
         self.fracvideos = {}
@@ -131,7 +142,10 @@ class MultiDataset(ConcatDataset):
         self.lens = [len(dataset) for dataset in self.datasets]
 
         # Create a combined sampler from all datasets
-        self._create_combined_sampler()
+        if self.deterministic_combined_shuffle:
+            self._create_combined_sampler(shuffle_epoch=0)
+        else:
+            self._create_combined_sampler(shuffle_epoch=None)
 
         # Store curriculum learning information
         self.max_steps_frameskip = (
@@ -140,8 +154,13 @@ class MultiDataset(ConcatDataset):
             else 0
         )
 
-    def _create_combined_sampler(self):
-        """Create a combined sampler from all datasets."""
+    def _create_combined_sampler(self, shuffle_epoch=None):
+        """Create a combined sampler from all datasets.
+
+        Args:
+            shuffle_epoch: If ``deterministic_combined_shuffle`` and ``shuffle`` are True,
+                permute with ``Random(combined_shuffle_seed + shuffle_epoch)`` (DDP-safe).
+        """
         multi_sampler = []
         offset = 0
         for dataset in self.datasets:
@@ -151,7 +170,14 @@ class MultiDataset(ConcatDataset):
             offset += len(dataset)
 
         if self.shuffle:
-            random.shuffle(multi_sampler)
+            if self.deterministic_combined_shuffle and shuffle_epoch is not None:
+                rng = random.Random(self.combined_shuffle_seed + int(shuffle_epoch))
+                rng.shuffle(multi_sampler)
+            elif self.deterministic_combined_shuffle:
+                rng = random.Random(self.combined_shuffle_seed)
+                rng.shuffle(multi_sampler)
+            else:
+                random.shuffle(multi_sampler)
         self.sampler = multi_sampler
 
     def _get_ds_from_idx(self, idx: int) -> tuple[int, int] | tuple[None, None]:
@@ -201,11 +227,20 @@ class MultiDataset(ConcatDataset):
         dsidx, localidx = self._get_ds_from_idx(idx)
         return self.datasets[dsidx][localidx]
 
-    def reset_sampler(self):
-        """Reset the sampler for all datasets and recreate the combined sampler."""
+    def reset_sampler(self, next_shuffle_epoch=None):
+        """Reset the sampler for all datasets and recreate the combined sampler.
+
+        Args:
+            next_shuffle_epoch: When ``deterministic_combined_shuffle`` is True (DDP), pass the
+                training epoch index this shuffle prepares for (typically ``e + 1`` after finishing epoch ``e``).
+        """
         for dataset in self.datasets:
             dataset.reset_sampler()
-        self._create_combined_sampler()
+        if self.deterministic_combined_shuffle:
+            ep = 0 if next_shuffle_epoch is None else int(next_shuffle_epoch)
+            self._create_combined_sampler(shuffle_epoch=ep)
+        else:
+            self._create_combined_sampler(shuffle_epoch=None)
 
     def samplesummary(self):
         """

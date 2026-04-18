@@ -17,6 +17,7 @@ from typing import Any, Dict, List
 
 import torch.nn as nn
 
+from gatetracker.distributed_context import unwrap_model
 from gatetracker.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -82,6 +83,8 @@ def build_optimizer_param_groups(model: nn.Module, config: Any) -> List[Dict[str
     lr_fusion = float(_cfg_get(config, "LR_FUSION", lr_default))
     lr_fine = float(_cfg_get(config, "LR_FINE_FEATURE", lr_default))
     lr_track = float(_cfg_get(config, "LR_TRACKING_HEAD", lr_default))
+
+    model = unwrap_model(model)
 
     groups: List[Dict[str, Any]] = []
     assigned: set[int] = set()

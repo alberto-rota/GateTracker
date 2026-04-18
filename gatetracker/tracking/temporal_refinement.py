@@ -96,16 +96,21 @@ class TemporalRefinementNetwork(nn.Module):
         corr_radius: int = 3,
         kernel_size: int = 5,
         pos_encoding_bands: int = 16,
+        softmax_temperature: float = 0.1,
     ):
         """
         Args:
-            feature_dim:  Channel dimension of fine feature maps from the backbone.
-            hidden_dim:   Hidden dimension of the temporal mixer.
-            num_blocks:   Number of TemporalMixerBlocks per iteration.
-            num_iters:    Number of refinement iterations (weight-shared).
-            corr_radius:  Radius of the local correlation window (side = 2r+1).
-            kernel_size:  Temporal convolution kernel size.
-            pos_encoding_bands: Fourier encoding frequency bands.
+            feature_dim:         Channel dimension of fine feature maps from the backbone.
+            hidden_dim:          Hidden dimension of the temporal mixer.
+            num_blocks:          Number of TemporalMixerBlocks per iteration.
+            num_iters:           Number of refinement iterations (weight-shared).
+            corr_radius:         Radius of the local correlation window (side = 2r+1).
+            kernel_size:         Temporal convolution kernel size.
+            pos_encoding_bands:  Fourier encoding frequency bands.
+            softmax_temperature: Temperature for the deterministic soft-argmax
+                sub-pixel offset applied at every iteration. Mirrors the matching
+                refiner's ``FINE_REFINEMENT_TEMPERATURE`` so the temporal network
+                inherits the same continuous (non-snap) localization.
         """
         super().__init__()
         self.feature_dim = feature_dim
@@ -113,6 +118,7 @@ class TemporalRefinementNetwork(nn.Module):
         self.num_iters = num_iters
         self.corr_radius = corr_radius
         self.pos_encoding_bands = pos_encoding_bands
+        self.softmax_temperature = float(softmax_temperature)
 
         corr_window = (2 * corr_radius + 1) ** 2
         # xy (2 dims) + time (1 dim) → each with (2*bands + 1) encoding
@@ -136,60 +142,110 @@ class TemporalRefinementNetwork(nn.Module):
         nn.init.zeros_(self.delta_head.weight)
         nn.init.zeros_(self.delta_head.bias)
 
+    # Soft cap on the number of elements in the per-call ``grid_sample``
+    # output. Above ~INT_MAX = 2**31 the cuDNN ``grid_sampler`` kernel raises
+    # ``CUDNN_STATUS_NOT_SUPPORTED``; beyond that the intermediate also
+    # dominates VRAM (e.g. B=32, T=24, Q=1024, W_w=9, C=64 needs ~16 GB just
+    # for ``sampled``). We chunk along the query axis to stay well below
+    # both limits while preserving exact equivalence (per-point op is
+    # independent across queries).
+    _GRID_SAMPLE_MAX_ELEMENTS: int = 1 << 28  # 2.7e8 elements per chunk
+
     def _extract_local_correlation(
         self,
         query_features: torch.Tensor,
         feature_maps: torch.Tensor,
         positions: torch.Tensor,
         feature_stride: int,
-    ) -> torch.Tensor:
-        """Extract local correlation volumes around predicted positions.
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Extract local correlation volumes and a soft-argmax sub-pixel offset.
+
+        The soft-argmax offset mirrors ``feature_softargmax_refiner`` used by the
+        matching pipeline: it is a deterministic, fully differentiable continuous
+        sub-pixel shift in pixel units, computed from the local correlation over
+        the fine feature map. Feeding it back into ``current_tracks`` breaks the
+        16-px patch-grid "snap" that arises when the learned delta head still
+        outputs ~0 (e.g. early in training).
+
+        For long-horizon dense tracking (large ``Q``, large ``W_w``, long ``T``)
+        the intermediate sampled tensor would exceed cuDNN's INT_MAX limit, so
+        the work is automatically chunked along the query axis.
 
         Args:
-            query_features: [B, Q, C] query descriptors from frame 0.
+            query_features: [B, Q, C] query descriptors from frame 0
+                (already L2-normalized by ``sample_embeddings_at_points``).
             feature_maps:   [B, T, C, H_f, W_f] fine feature maps.
             positions:      [B, Q, T, 2] current position estimates (pixel coords).
             feature_stride: Pixel stride of the feature map.
 
         Returns:
-            [B, Q, T, W_w^2] local correlation volumes.
+            corr:              [B, Q, T, W_w^2] raw correlation features for the mixer.
+            soft_argmax_delta: [B, Q, T, 2] expected sub-pixel shift in pixel units.
         """
         B, T, C, H_f, W_f = feature_maps.shape
         Q = query_features.shape[1]
         r = self.corr_radius
         W_w = 2 * r + 1
 
-        # Convert pixel positions to feature coordinates
-        feat_coords = positions / feature_stride  # [B, Q, T, 2]
-
-        # Build local offset grid: [W_w^2, 2]
         offsets = torch.arange(-r, r + 1, device=positions.device, dtype=positions.dtype)
         oy, ox = torch.meshgrid(offsets, offsets, indexing="ij")
         offset_grid = torch.stack([ox.reshape(-1), oy.reshape(-1)], dim=-1)  # [W_w^2, 2]
 
-        # Sample positions: [B, Q, T, W_w^2, 2]
-        sample_coords = feat_coords.unsqueeze(-2) + offset_grid  # [B, Q, T, W_w^2, 2]
+        # Choose Q chunk size so each ``grid_sample`` output stays under the
+        # element budget. The per-chunk output is [B*T, C, q*W_w^2, 1].
+        elems_per_query = max(1, B * T * C * W_w * W_w)
+        q_chunk = max(1, min(Q, self._GRID_SAMPLE_MAX_ELEMENTS // elems_per_query))
 
-        # Normalize to [-1, 1] for grid_sample
-        sample_norm = sample_coords.clone()
-        sample_norm[..., 0] = sample_norm[..., 0] / max(W_f - 1, 1) * 2 - 1
-        sample_norm[..., 1] = sample_norm[..., 1] / max(H_f - 1, 1) * 2 - 1
+        fmaps_flat = feature_maps.reshape(B * T, C, H_f, W_f).contiguous()
+        offset_pixels = offset_grid * float(feature_stride)  # [W_w^2, 2]
+        offset_pixels_view = offset_pixels.view(1, 1, 1, -1, 2)
+        inv_temp = 1.0 / max(self.softmax_temperature, 1e-6)
 
-        # Reshape for grid_sample: [B*T, C, H_f, W_f] with grid [B*T, Q*W_w^2, 1, 2]
-        fmaps_flat = feature_maps.reshape(B * T, C, H_f, W_f)
-        grid_flat = sample_norm.permute(0, 2, 1, 3, 4).reshape(B * T, Q * W_w * W_w, 1, 2)
+        corr_chunks = []
+        delta_chunks = []
+        for q_start in range(0, Q, q_chunk):
+            q_end = min(q_start + q_chunk, Q)
+            qf = query_features[:, q_start:q_end]              # [B, q, C]
+            pos = positions[:, q_start:q_end]                   # [B, q, T, 2]
 
-        sampled = F.grid_sample(
-            fmaps_flat, grid_flat, mode="bilinear", align_corners=True,
-        )  # [B*T, C, Q*W_w^2, 1]
-        sampled = sampled.squeeze(-1).reshape(B, T, C, Q, W_w * W_w)  # [B, T, C, Q, W_w^2]
-        sampled = sampled.permute(0, 3, 1, 4, 2)  # [B, Q, T, W_w^2, C]
+            feat_coords = pos / feature_stride                  # [B, q, T, 2]
+            sample_coords = feat_coords.unsqueeze(-2) + offset_grid  # [B, q, T, W_w^2, 2]
 
-        # Dot product with query features
-        query_exp = query_features.unsqueeze(2).unsqueeze(3)  # [B, Q, 1, 1, C]
-        corr = (sampled * query_exp).sum(dim=-1)  # [B, Q, T, W_w^2]
+            sample_norm = torch.empty_like(sample_coords)
+            sample_norm[..., 0] = sample_coords[..., 0] / max(W_f - 1, 1) * 2 - 1
+            sample_norm[..., 1] = sample_coords[..., 1] / max(H_f - 1, 1) * 2 - 1
 
-        return corr
+            q = q_end - q_start
+            grid_flat = (
+                sample_norm.permute(0, 2, 1, 3, 4)
+                .contiguous()
+                .reshape(B * T, q * W_w * W_w, 1, 2)
+            )
+
+            sampled = F.grid_sample(
+                fmaps_flat, grid_flat, mode="bilinear", align_corners=True,
+            )  # [B*T, C, q*W_w^2, 1]
+            sampled = sampled.squeeze(-1).reshape(B, T, C, q, W_w * W_w)
+            sampled = sampled.permute(0, 3, 1, 4, 2)  # [B, q, T, W_w^2, C]
+
+            query_exp = qf.unsqueeze(2).unsqueeze(3)  # [B, q, 1, 1, C]
+            corr_chunk = (sampled * query_exp).sum(dim=-1)  # [B, q, T, W_w^2]
+
+            q_norm = F.normalize(qf, dim=-1).unsqueeze(2).unsqueeze(3)
+            s_norm = F.normalize(sampled, dim=-1)
+            logits = (s_norm * q_norm).sum(dim=-1)  # [B, q, T, W_w^2]
+            probs = torch.softmax(logits * inv_temp, dim=-1)
+            soft_argmax_delta_chunk = (
+                probs.unsqueeze(-1) * offset_pixels_view
+            ).sum(dim=-2)  # [B, q, T, 2]
+
+            corr_chunks.append(corr_chunk)
+            delta_chunks.append(soft_argmax_delta_chunk)
+            del sampled, sample_norm, sample_coords, grid_flat, logits, probs
+
+        if len(corr_chunks) == 1:
+            return corr_chunks[0], delta_chunks[0]
+        return torch.cat(corr_chunks, dim=1), torch.cat(delta_chunks, dim=1)
 
     def forward(
         self,
@@ -225,12 +281,17 @@ class TemporalRefinementNetwork(nn.Module):
 
         all_vis_logits = []
         for _iter in range(self.num_iters):
-            # 1. Local correlation
-            corr = self._extract_local_correlation(
+            # 1. Local correlation + deterministic soft-argmax sub-pixel offset.
+            #    ``soft_argmax_delta`` is the exact same quantity that the matching
+            #    refiner (``feature_softargmax_refiner``) uses, just evaluated at
+            #    every frame. Applying it unconditionally gives continuous (non-
+            #    snap) localization even when ``delta_head`` still outputs ~0.
+            corr, soft_argmax_delta = self._extract_local_correlation(
                 query_features, feature_maps, current_tracks, feature_stride,
-            )  # [B, Q, T, W_w^2]
+            )  # corr: [B, Q, T, W_w^2], soft_argmax_delta: [B, Q, T, 2]
+            current_tracks = current_tracks + soft_argmax_delta
 
-            # 2. Position encoding
+            # 2. Position encoding (use the post-softargmax position)
             pos_input = torch.cat([
                 current_tracks,  # [B, Q, T, 2]
                 t_idx.expand(B, Q, -1, -1),  # [B, Q, T, 1]
@@ -246,18 +307,17 @@ class TemporalRefinementNetwork(nn.Module):
                 hidden.reshape(B, Q, T, self.hidden_dim),
             ], dim=-1)  # [B, Q, T, input_dim]
 
-            # Reshape to [BQ, T, D] for mixer blocks
-            x = mixer_input.reshape(B * Q, T, -1)
-            x = self.input_proj(x)  # [BQ, T, hidden_dim]
+            x = mixer_input.reshape(B * Q, T, -1)  # [BQ, T, input_dim]
+            x = self.input_proj(x)                 # [BQ, T, hidden_dim]
 
             for block in self.blocks:
                 x = block(x)  # [BQ, T, hidden_dim]
 
             hidden = x  # [BQ, T, hidden_dim]
 
-            # 4. Predict delta and visibility
+            # 4. Residual delta on top of the soft-argmax position and visibility.
             delta = self.delta_head(x).reshape(B, Q, T, 2)  # [B, Q, T, 2]
-            vis_logit = self.vis_head(x).reshape(B, Q, T)  # [B, Q, T]
+            vis_logit = self.vis_head(x).reshape(B, Q, T)   # [B, Q, T]
 
             current_tracks = current_tracks + delta
             all_vis_logits.append(vis_logit)

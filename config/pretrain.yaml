@@ -25,11 +25,18 @@ parameters:
   IMAGE_WIDTH:
     value: 448
   BATCH_SIZE:
-    value: 8
+    value: 16
+  # singlegpu | dp | ddp (CLI ``--ddp`` / ``--dp`` / ``--single`` overrides this)
+  DISTRIBUTE:
+    value: "singlegpu"
+  DISTBACKEND:
+    value: "nccl"
+  DDP_SHUFFLE_SEED:
+    value: 978654321
   SHUFFLE:
     value: True
   WORKERS:
-    value: 1
+    value: 6
   PIN_MEMORY:
     value: True
   PREFETCH_FACTOR:
@@ -41,7 +48,7 @@ parameters:
   DATASETS:
     value:
       SCARED:
-        PATH: "/home/shared/nearmrs/arota/SCARED"
+        PATH: "SCARED"
         FPS: 32
         FRAMESKIP: [1, 2, 4, 8, 16, 24, 32]
         TRAIN_VIDEOS: ["train_v*"]
@@ -59,7 +66,7 @@ parameters:
         CROP_ZOOM_FACTOR: 1.0
 
       CHOLEC80:
-        PATH: "/home/shared/nearmrs/arota/CHOLEC80/videos"
+        PATH: "CHOLEC80/videos"
         FPS: 80
         FRAMESKIP: [1]
         TRAIN_VIDEOS: ["train_video02"]

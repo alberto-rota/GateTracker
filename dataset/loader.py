@@ -43,9 +43,10 @@ FEWFRAMES: false
 
 ## Environment Variables
 
-- **DATASET_ROOTDIR**: Base directory for all datasets (optional). Can be set in `.env` file.
-  If set, relative paths in the config will be resolved relative to this directory.
-  Absolute paths in config are used as-is for backward compatibility.
+- **DATASET_DIR**: Base directory for all datasets (preferred). Set in ``.env``; relative
+  ``PATH`` values in YAML are resolved under this directory. Absolute ``PATH`` values stay
+  as-is unless they use ``$DATASET_DIR/...``.
+- **DATASET_ROOTDIR**: Legacy alias for ``DATASET_DIR`` (optional).
 
 ## Usage Example
 
@@ -89,6 +90,11 @@ from utilities import get_hostname, detect_aval_cpus, coloredbar
 from .multi_dataset import MultiDataset
 from .specialized import SCARED, CHOLEC80, GRASP, STEREOMIS
 from .utils import split_videos, select_videos_by_patterns
+
+try:
+    from gatetracker.env_bootstrap import resolve_dataset_filesystem_path
+except ImportError:  # minimal contexts without gatetracker on PYTHONPATH
+    resolve_dataset_filesystem_path = None  # type: ignore[misc, assignment]
 
 logger = get_logger(__name__).set_context("DATASET")
 
@@ -279,29 +285,30 @@ def initialize_from_config(config, inference=False, verbose=False):
     ## Notes
 
     - The function automatically detects available CPUs for dataloader workers
-    - If `DATASET_ROOTDIR` environment variable is set (via `.env` file or environment), 
-      it will be prepended to relative paths in the config. Absolute paths in config are 
-      used as-is for backward compatibility.
+    - If ``DATASET_DIR`` (or legacy ``DATASET_ROOTDIR``) is set, relative ``PATH`` entries
+      are resolved under that directory. Absolute paths in YAML are kept as-is for backward
+      compatibility (unless they use ``$DATASET_DIR`` expansion).
     - All datasets are combined into `MultiDataset` instances for unified access
     - Dataloaders use the dataset's sampler for proper curriculum learning
     
     ## Environment Variables
     
-    - **DATASET_ROOTDIR**: Base directory for datasets. Can be set in `.env` file.
-      If set, relative paths in config will be resolved relative to this directory.
-      Example: If `DATASET_ROOTDIR=/home/shared/nearmrs` and `PATH: "SCARED"`, 
-      the final path will be `/home/shared/nearmrs/SCARED`.
+    - **DATASET_DIR**: Base directory for datasets (``.env``). Example: ``DATASET_DIR=/data``
+      and ``PATH: "SCARED"`` resolves to ``/data/SCARED``.
     """
     # Initialize configuration parameters in global namespace for backward compatibility
     for key, value in config.items():
         globals()[key] = value
 
-    # Setup device and compute resources
-    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Setup device and compute resources (per-rank CUDA under DDP / torchrun)
+    _dist = str(config.get("DISTRIBUTE", "singlegpu")).strip().lower()
+    if _dist == "ddp" and torch.cuda.is_available():
+        _lr = int(config.get("LOCAL_RANK", 0))
+        DEVICE = torch.device(f"cuda:{_lr}")
+    else:
+        DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     config.HOSTNAME = get_hostname()
     NUM_WORKERS = detect_aval_cpus()
-    DATASET_ROOTDIR = os.environ.get("DATASET_ROOTDIR")
-
     # Get datasets configuration
     datasets_config = config.get("DATASETS", {})
     if not datasets_config:
@@ -319,27 +326,24 @@ def initialize_from_config(config, inference=False, verbose=False):
     for dataset_name, dataset_config in datasets_config.items():
         all_dataset_names.append(dataset_name)
 
-        # Get dataset path from config
+        # Get dataset path from config (DATASET_DIR / DATASET_ROOTDIR via env_bootstrap)
         config_path = dataset_config.get("PATH")
-        
-        # Prepend DATASET_ROOTDIR if it's set in .env
-        # If PATH is already absolute and DATASET_ROOTDIR is set, use PATH as-is (backward compatible)
-        # If PATH is relative and DATASET_ROOTDIR is set, prepend DATASET_ROOTDIR
-        if DATASET_ROOTDIR:
-            if config_path:
-                # Check if path is absolute (starts with / on Unix or has drive letter on Windows)
-                if os.path.isabs(config_path):
-                    # Absolute path: use as-is for backward compatibility
-                    dataset_path = config_path
-                else:
-                    # Relative path: prepend DATASET_ROOTDIR
-                    dataset_path = os.path.join(DATASET_ROOTDIR, config_path)
-            else:
-                # If PATH is not in config but DATASET_ROOTDIR is set, use dataset_name as fallback
-                dataset_path = os.path.join(DATASET_ROOTDIR, dataset_name)
+        if resolve_dataset_filesystem_path is not None:
+            dataset_path = resolve_dataset_filesystem_path(config_path, dataset_name)
         else:
-            # No DATASET_ROOTDIR: use PATH from config as-is
-            dataset_path = config_path
+            dataset_base = os.environ.get("DATASET_DIR") or os.environ.get(
+                "DATASET_ROOTDIR"
+            )
+            if dataset_base and config_path:
+                expanded = os.path.expandvars(os.path.expanduser(str(config_path)))
+                if os.path.isabs(expanded):
+                    dataset_path = expanded
+                else:
+                    dataset_path = os.path.join(dataset_base, expanded)
+            elif dataset_base and not config_path:
+                dataset_path = os.path.join(dataset_base, dataset_name)
+            else:
+                dataset_path = config_path
 
         # Get dataset videos
         dataset_class = globals().get(dataset_name)
@@ -492,9 +496,27 @@ def initialize_from_config(config, inference=False, verbose=False):
         test_datasets.append(test_ds)
 
     # Create multi-datasets for training and validation
-    training_ds = MultiDataset(training_datasets)
-    validation_ds = MultiDataset(validation_datasets)
-    test_ds = MultiDataset(test_datasets)
+    _ddp_det = _dist == "ddp"
+    _ddp_seed = int(config.get("DDP_SHUFFLE_SEED", 978654321))
+    _shuffle = bool(config.get("SHUFFLE", True))
+    training_ds = MultiDataset(
+        training_datasets,
+        shuffle=_shuffle,
+        deterministic_combined_shuffle=_ddp_det,
+        combined_shuffle_seed=_ddp_seed,
+    )
+    validation_ds = MultiDataset(
+        validation_datasets,
+        shuffle=_shuffle,
+        deterministic_combined_shuffle=_ddp_det,
+        combined_shuffle_seed=_ddp_seed,
+    )
+    test_ds = MultiDataset(
+        test_datasets,
+        shuffle=_shuffle,
+        deterministic_combined_shuffle=_ddp_det,
+        combined_shuffle_seed=_ddp_seed,
+    )
 
     # Create dataloaders with custom collate function to handle None values
     training_dl, validation_dl, test_dl = [

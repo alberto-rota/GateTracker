@@ -74,7 +74,7 @@ class Engine:
         self.config["NOTES"] = notes
 
         # Initialize device and directories
-        device_dirs = initialize.device_and_directories()
+        device_dirs = initialize.device_and_directories(config)
         self.device = device_dirs["device"]
         self.RUNS_DIR = device_dirs["runs_dir"]
 
@@ -166,22 +166,29 @@ class Engine:
         if os.path.isfile(ref):
             return ref
 
-        # Interpret bare names as run names and probe common checkpoint locations.
-        looks_like_run_name = (os.sep not in ref) and (not os.path.splitext(ref)[1])
-        if not looks_like_run_name:
-            return None
+        try:
+            from gatetracker.env_bootstrap import pretrained_checkpoint_path_candidates
 
-        candidate_paths = [
-            os.path.join(self.RUNS_DIR, ref, "models", f"{ref}_checkpoint.pth"),
-            os.path.join(self.RUNS_DIR, ref, "checkpoints", "weights_best.pt"),
-            os.path.join("runs", ref, "models", f"{ref}_checkpoint.pth"),
-            os.path.join("runs", ref, "checkpoints", "weights_best.pt"),
-            os.path.join("checkpoints", f"{ref}_checkpoint.pth"),
-            os.path.join("checkpoints", f"{ref}.pt"),
-        ]
-        for candidate in candidate_paths:
-            if os.path.isfile(candidate):
-                return candidate
+            for candidate in pretrained_checkpoint_path_candidates(
+                ref, runs_dir=self.RUNS_DIR
+            ):
+                if os.path.isfile(candidate):
+                    return candidate
+        except ImportError:
+            looks_like_run_name = (os.sep not in ref) and (not os.path.splitext(ref)[1])
+            if not looks_like_run_name:
+                return None
+            candidate_paths = [
+                os.path.join(self.RUNS_DIR, ref, "models", f"{ref}_checkpoint.pth"),
+                os.path.join(self.RUNS_DIR, ref, "checkpoints", "weights_best.pt"),
+                os.path.join("runs", ref, "models", f"{ref}_checkpoint.pth"),
+                os.path.join("runs", ref, "checkpoints", "weights_best.pt"),
+                os.path.join("checkpoints", f"{ref}_checkpoint.pth"),
+                os.path.join("checkpoints", f"{ref}.pt"),
+            ]
+            for candidate in candidate_paths:
+                if os.path.isfile(candidate):
+                    return candidate
         return None
 
     def _load_pretrained_checkpoint(self) -> None:

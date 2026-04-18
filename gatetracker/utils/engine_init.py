@@ -20,6 +20,7 @@ from gatetracker.matching.matcher import Matcher
 import gatetracker.utils.optimization as optimization
 from rich import print
 from gatetracker.utils.logger import get_logger
+from gatetracker.env_bootstrap import results_dir_default
 
 logger = get_logger(__name__)
 
@@ -57,14 +58,28 @@ class _NullLRScheduler:
         return
 
 
-def device_and_directories():
-    """Initialize device and create necessary directories"""
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def device_and_directories(config=None):
+    """Initialize device and create necessary directories (per-rank CUDA when ``DISTRIBUTE==ddp``)."""
+    if config is None:
+        config = {}
+    from gatetracker.distributed_context import (
+        is_ddp_enabled,
+        is_dp_enabled,
+    )
 
-    # Create base directories
-    if not os.path.exists("runs"):
-        os.makedirs("runs")  # Create 'runs' directory if it doesn't exist
-    runs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../runs")
+    if is_ddp_enabled(config) and torch.cuda.is_available():
+        lr = int(config.get("LOCAL_RANK", 0))
+        device = torch.device(f"cuda:{lr}")
+    elif is_dp_enabled(config) and torch.cuda.is_available() and torch.cuda.device_count() > 1:
+        device = torch.device("cuda:0")
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    package_runs_fallback = os.path.normpath(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "runs")
+    )
+    runs_dir = results_dir_default(package_runs_fallback=package_runs_fallback)
+    os.makedirs(runs_dir, exist_ok=True)
 
     return {"device": device, "runs_dir": runs_dir}
 
@@ -73,26 +88,44 @@ def dataloaders(dataset, config):
     """Initialize datasets and dataloaders"""
     # Lazy import to avoid circular dependency
     from dataset.loader import collate_fn
-    
+    from gatetracker.distributed_context import ShardedListSampler, is_ddp_enabled
+
     # Store dataset references
     training_ds = dataset["Training"]  # Training dataset
     validation_ds = dataset["Validation"]  # Validation dataset
     test_ds = dataset["Test"]  # Testing dataset
     workers = dataset["workers"]  # Number of workers for data loading
 
-    # Dataloaders only for initialization purposes (samplers will be modified)
-    training_dl = torch.utils.data.DataLoader(
-        training_ds,
-        batch_size=config["BATCH_SIZE"],
-        sampler=training_ds.sampler,
-        collate_fn=collate_fn,
-    )
-    validation_dl = torch.utils.data.DataLoader(
-        validation_ds,
-        batch_size=config["BATCH_SIZE"],
-        sampler=validation_ds.sampler,
-        collate_fn=collate_fn,
-    )
+    if is_ddp_enabled(config):
+        r = int(config.get("RANK", 0))
+        ws = int(config.get("WORLD_SIZE", 1))
+        tr_s = ShardedListSampler(training_ds, r, ws)
+        va_s = ShardedListSampler(validation_ds, r, ws)
+        training_dl = torch.utils.data.DataLoader(
+            training_ds,
+            batch_size=config["BATCH_SIZE"],
+            sampler=tr_s,
+            collate_fn=collate_fn,
+        )
+        validation_dl = torch.utils.data.DataLoader(
+            validation_ds,
+            batch_size=config["BATCH_SIZE"],
+            sampler=va_s,
+            collate_fn=collate_fn,
+        )
+    else:
+        training_dl = torch.utils.data.DataLoader(
+            training_ds,
+            batch_size=config["BATCH_SIZE"],
+            sampler=training_ds.sampler,
+            collate_fn=collate_fn,
+        )
+        validation_dl = torch.utils.data.DataLoader(
+            validation_ds,
+            batch_size=config["BATCH_SIZE"],
+            sampler=validation_ds.sampler,
+            collate_fn=collate_fn,
+        )
 
     return {
         "dataset": {
@@ -311,7 +344,17 @@ def schedulers(optimizer, config, training_dl):
       cycles over the **total** optimizer-step count (``T_max = total_steps // n_periods``).
     - **Plateau** uses ``ReduceLROnPlateau`` only; no noisy cosine/step scheduler runs alongside it.
     """
+    from gatetracker.distributed_context import is_ddp_enabled
+
     batches_per_epoch = len(training_dl)
+    if is_ddp_enabled(config):
+        from gatetracker.distributed_context import ShardedListSampler
+
+        ws = max(1, int(config.get("WORLD_SIZE", 1)))
+        r = int(config.get("RANK", 0))
+        n_shard = len(ShardedListSampler(training_dl.dataset, r, ws))
+        bs = max(1, int(config.get("BATCH_SIZE", 1)))
+        batches_per_epoch = max(1, n_shard // bs)
     n_epochs = int(config.get("EPOCHS", 1))
     warmup_steps = int(config.get("WARMUP_STEPS", 0))
     grad_accum = int(config.get("GRADIENT_ACCUMULATION_STEPS", 1))
@@ -389,6 +432,11 @@ def wandb(config, model=None, notes="", no_wandb=False):
     if no_wandb:
         return {"wandb": None, "testtable": None}
 
+    from gatetracker.distributed_context import is_ddp_enabled
+
+    if is_ddp_enabled(config) and int(config.get("RANK", 0)) != 0:
+        return {"wandb": None, "testtable": None}
+
     logger.set_context("WANDB")
     wandb_entity = config.get("WANDB_ENTITY", None)
     if isinstance(wandb_entity, str) and wandb_entity.strip() == "":
@@ -452,25 +500,16 @@ def wandb(config, model=None, notes="", no_wandb=False):
         ]
     )
 
-    wandb_instance.watch(model, log="all", log_freq=config["MODEL_WATCHER_FREQ_WANDB"])
+    if model is not None:
+        wandb_instance.watch(model, log="all", log_freq=config["MODEL_WATCHER_FREQ_WANDB"])
     return {"wandb": wandb_instance, "testtable": testtable}
 
 
 def _define_wandb_metrics():
-    """Define metric structures for WandB"""
-    weightsandbiases.define_metric("Step/batch")
-    weightsandbiases.define_metric("Step/valbatch")
-    weightsandbiases.define_metric("Step/lossissues")
+    """Define W&B custom x-axes (train/val/test batch + epoch)."""
+    from gatetracker.metrics.logging import register_wandb_step_axes
 
-    weightsandbiases.define_metric("Issues/*", step_metric="Step/lossissues")
-    weightsandbiases.define_metric("Training/*", step_metric="Step/batch")
-    weightsandbiases.define_metric("Gradients/*", step_metric="Step/batch")
-    weightsandbiases.define_metric("Validation/*", step_metric="Step/valbatch")
-    weightsandbiases.define_metric("HyperParameters/*", step_metric="Step/batch")
-
-    weightsandbiases.define_metric("Step/epoch")
-    weightsandbiases.define_metric("Training/epoch*", step_metric="Step/epoch")
-    weightsandbiases.define_metric("Validation/epoch*", step_metric="Step/epoch")
+    register_wandb_step_axes(weightsandbiases)
 
 
 def tracking_metrics():
@@ -511,11 +550,25 @@ def tracking_metrics():
     }
 
 
-def setup_run_directories(runs_dir, wandb_instance=None, savelocally=False):
-    """Set up directories for storing run artifacts"""
+def setup_run_directories(runs_dir, wandb_instance=None, savelocally=False, config=None):
+    """Set up directories for storing run artifacts (DDP: broadcast run name from rank 0)."""
     runname = wandb_instance.name if wandb_instance is not None else None
+    if (runname is None or runname == "") and config is not None:
+        r = config.get("RUN", None) if hasattr(config, "get") else getattr(config, "RUN", None)
+        if r is not None and str(r).strip():
+            runname = str(r).strip()
     if runname is None or runname == "":
         runname = "offline_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    import torch.distributed as dist
+
+    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        if dist.get_rank() == 0:
+            payload = [runname]
+        else:
+            payload = [""]
+        dist.broadcast_object_list(payload, src=0)
+        runname = payload[0]
 
     run_dir = os.path.join(runs_dir, f"{runname}")
     os.makedirs(run_dir, exist_ok=True)
@@ -571,6 +624,11 @@ def matching_pipeline(config, model, device):
 
 def save_hyperparameters_json(run_dir, config):
     """Save hyperparameters to disk"""
+    from gatetracker.distributed_context import is_main_process
+
+    if not is_main_process():
+        return
+
     hyperparams_path = os.path.join(run_dir, "hyperparams.json")
 
     if not os.path.exists(hyperparams_path):

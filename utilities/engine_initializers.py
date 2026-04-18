@@ -24,14 +24,27 @@ from logger import get_logger
 logger = get_logger(__name__)
 
 
-def device_and_directories():
-    """Initialize device and create necessary directories"""
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def device_and_directories(config=None):
+    """Initialize device and create necessary directories (optional DDP/DP via ``config``)."""
+    if config is None:
+        config = {}
+    d = str(config.get("DISTRIBUTE", "singlegpu")).strip().lower()
+    if d == "ddp" and torch.cuda.is_available():
+        device = torch.device(f"cuda:{int(config.get('LOCAL_RANK', 0))}")
+    elif d == "dp" and torch.cuda.is_available() and torch.cuda.device_count() > 1:
+        device = torch.device("cuda:0")
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Create base directories
-    if not os.path.exists("runs"):
-        os.makedirs("runs")  # Create 'runs' directory if it doesn't exist
-    runs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../runs")
+    package_runs_fallback = os.path.normpath(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "runs")
+    )
+    runs_dir = os.path.normpath(
+        os.path.expandvars(
+            os.environ.get("RESULTS_DIR", package_runs_fallback),
+        )
+    )
+    os.makedirs(runs_dir, exist_ok=True)
 
     return {"device": device, "runs_dir": runs_dir}
 
@@ -424,23 +437,10 @@ def wandb(config, model=None, notes="", no_wandb=False):
 
 
 def _define_wandb_metrics():
-    """Define metric structures for WandB"""
-    # Step metrics
-    weightsandbiases.define_metric("Step/batch")
-    weightsandbiases.define_metric("Step/valbatch")
-    weightsandbiases.define_metric("Step/lossissues")
+    """Define W&B custom x-axes (train/val/test batch + epoch)."""
+    from gatetracker.metrics.logging import register_wandb_step_axes
 
-    # Group metrics by step
-    weightsandbiases.define_metric("Issues/*", step_metric="Step/lossissues")
-    weightsandbiases.define_metric("Training/*", step_metric="Step/batch")
-    weightsandbiases.define_metric("Gradients/*", step_metric="Step/batch")
-    weightsandbiases.define_metric("Validation/*", step_metric="Step/valbatch")
-    weightsandbiases.define_metric("HyperParameters/*", step_metric="Step/batch")
-
-    # Epoch metrics
-    weightsandbiases.define_metric("Step/epoch")
-    weightsandbiases.define_metric("Training/epoch*", step_metric="Step/epoch")
-    weightsandbiases.define_metric("Validation/epoch*", step_metric="Step/epoch")
+    register_wandb_step_axes(weightsandbiases)
 
 
 def tracking_metrics():

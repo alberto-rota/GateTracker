@@ -1,100 +1,24 @@
-"""GateTracker - Entry point for training and evaluation."""
+"""
+Legacy compatibility: W&B sweep workers may use ``import main`` / ``main.train``.
 
-import os
-import yaml
-import time
-import argparse
-import ast
+Prefer: ``python train.py`` / ``python test.py`` or ``from gatetracker.pipeline import run_pipeline``.
+"""
+
+from gatetracker.pipeline import run_pipeline
 
 
-def run_pipeline(mode="train", config=None):
-    import torch
-    import cv2
-    from dotmap import DotMap
-    from rich.traceback import install
-
-    from gatetracker.utils.logger import get_logger
-    from gatetracker.data import initialize_from_config
-    from gatetracker.engine import Engine
-
-    install(show_locals=False)
-    logger = get_logger(__name__).set_context("MAIN")
-
-    # Parse arguments
-    parser = argparse.ArgumentParser(description="GateTracker")
-    parser.add_argument("mode", nargs="?", default=mode, choices=["train", "test"])
-    parser.add_argument("--boot", "-b", action="store_true", help="Minimal smoke-test mode")
-    parser.add_argument("--config", "-c", type=str, default=None, help="Config YAML path")
-    parser.add_argument("--record", "-r", action="store_true", help="Record run notes")
-    if config is not None:
-        # wandb agent passes --KEY=value for every sweep param; argparse would treat the first
-        # token as positional ``mode`` and fail. Use defaults + explicit ``mode`` from the caller.
-        args, unknown = parser.parse_known_args([])
-    else:
-        args, unknown = parser.parse_known_args()
-        mode = args.mode
-
-    # System info
-    logger.info(f"PyTorch {torch.__version__} | CUDA {torch.version.cuda} | Python {__import__('sys').version.split()[0]}")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Device: {device}")
-
-    # Load config
+def train(config=None):
+    """Run training with a flat hyperparameter dict (e.g. ``wandb.config``)."""
     if config is None:
-        config_path = args.config or os.path.join("configs", f"config_{mode}.yaml")
-        with open(config_path, "r") as f:
-            raw_config = yaml.safe_load(f)
-        params = raw_config.get("parameters", raw_config)
-        config_dict = {}
-        for key, val in params.items():
-            if isinstance(val, dict) and "value" in val:
-                config_dict[key] = val["value"]
-            else:
-                config_dict[key] = val
-    else:
-        config_dict = config
-
-    # CLI overrides
-    for arg in unknown:
-        if arg.startswith("--") and "=" in arg:
-            key, value = arg[2:].split("=", 1)
-            key = key.upper()
-            if key in config_dict:
-                existing = config_dict[key]
-                if isinstance(existing, bool):
-                    value = value.lower() in ("true", "1", "yes")
-                elif isinstance(existing, (list, dict)):
-                    value = ast.literal_eval(value)
-                else:
-                    value = type(existing)(value)
-            config_dict[key] = value
-
-    config = DotMap(config_dict)
-
-    # Boot mode overrides
-    if args.boot:
-        config.BATCH_SIZE = 1
-        config.EPOCHS = 1
-        config.NO_WANDB = True
-        config.FEWFRAMES = True
-
-    # Run
-    try:
-        result = initialize_from_config(config, inference=(mode == "test"), verbose=True)
-        dataset = result["dataset"]
-        config = result["config"]
-        device = result["device"]
-        engine = Engine(model=config.RUN, dataset=dataset, config=config)
-
-        if mode == "train":
-            engine.trainloop()
-            engine.reinstantiate_model_from_checkpoint()
-            engine.test()
-        elif mode == "test":
-            engine.test()
-    except KeyboardInterrupt:
-        logger.info("Interrupted by user.", context="MAIN")
+        raise TypeError("main.train(config) requires a config mapping (e.g. from wandb).")
+    run_pipeline("train", config_dict=config)
 
 
-if __name__ == "__main__":
-    run_pipeline()
+def test(config=None):
+    """Run evaluation with a flat hyperparameter dict (e.g. ``wandb.config``)."""
+    if config is None:
+        raise TypeError("main.test(config) requires a config mapping (e.g. from wandb).")
+    run_pipeline("test", config_dict=config)
+
+
+__all__ = ["run_pipeline", "train", "test"]
