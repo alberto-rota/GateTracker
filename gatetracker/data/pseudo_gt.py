@@ -232,6 +232,16 @@ class TrajectoryConfig:
     speed_scale_range: ScalarOrFloatRange = (0.5, 1.5)
     still_fraction_range: ScalarOrFloatRange = (0.0, 0.15)
 
+    # Hard safety lower bound on the closest camera-to-cloud distance as a
+    # fraction of the scene's initial nearest-point distance.  When any
+    # frame of the sampled trajectory would breach this clearance, ALL
+    # translations are globally scaled down by a single bisected factor
+    # so that the worst-case frame exactly matches the bound.  Prevents
+    # the 'novel view becomes mostly black because the camera flew into
+    # the cloud' failure (points become too sparse in screen-space for
+    # the median-filter inpainting to cope with).  Set ``0`` to disable.
+    min_scene_clearance_frac: float = 0.5
+
 
 @dataclass
 class DeformationConfig:
@@ -268,6 +278,33 @@ class DeformationConfig:
 
     twist_max_deg_range: ScalarOrFloatRange = (1.0, 5.0)
     temporal_smooth_range: ScalarOrFloatRange = (2.0, 6.0)
+
+    # Optional per-type overrides for sigma / amplitude.  When ``None``
+    # (the default) the shared ``sigma_frac_range`` / ``amplitude_frac_range``
+    # is used instead — keeps backward compatibility.  Per-type overrides
+    # let you sculpt qualitatively different behaviours, e.g. large-smooth-
+    # low-amplitude inflations + small-concentrated-strong twists without
+    # cross-contaminating drag.
+    drag_sigma_frac_range: Optional[ScalarOrFloatRange] = None
+    drag_amplitude_frac_range: Optional[ScalarOrFloatRange] = None
+    inflate_sigma_frac_range: Optional[ScalarOrFloatRange] = None
+    inflate_amplitude_frac_range: Optional[ScalarOrFloatRange] = None
+    twist_sigma_frac_range: Optional[ScalarOrFloatRange] = None
+
+    # Hard cap on inflate peak 3-D displacement as a fraction of the
+    # scene extent.  Inflation moves points radially outward from the
+    # control centre; once the step exceeds the mean 3-D spacing of
+    # nearby points the screen-space cloud thins out enough to produce
+    # black holes even after inpainting.  Effective amplitude is clamped
+    # to ``min(sampled_amp, max_inflate_displacement_frac * extent)``.
+    max_inflate_displacement_frac: float = 0.015
+
+    # Softens the unit-radial direction near the control centre so that
+    # points within a tiny ball of the centre don't receive the full
+    # ``1 / ||d||`` spike.  Implemented as ``d / sqrt(||d||^2 + eps^2)``
+    # with ``eps = inflate_radial_softness * extent``.  Bigger values =
+    # smoother / bubblier inflations; very small = sharper spikes.
+    inflate_radial_softness: float = 0.05
 
 
 @dataclass
@@ -323,6 +360,16 @@ class OccluderConfig:
     appearance_noise_std: float = 0.05
     vis_alpha_threshold: float = 0.5
     apply_to_frame_valid: bool = True
+
+    # Domain-aware colour sampling.  When ``True`` each occluder's base
+    # RGB is sampled as the mean colour of a random square patch of the
+    # **source image** (endoscopic colours only, no out-of-domain blue
+    # sprites on red tissue), optionally multiplied by a brightness
+    # jitter.  When ``False`` falls back to the legacy uniform
+    # ``appearance_value_range`` sampler.
+    sample_color_from_image: bool = True
+    color_patch_frac_range: ScalarOrFloatRange = (0.02, 0.08)
+    color_brightness_range: ScalarOrFloatRange = (0.6, 1.2)
 
 
 @dataclass
@@ -414,6 +461,14 @@ def trajectory_config_from_run_config(config: Any, *, n_frames: int) -> Trajecto
         if raw is None:
             continue
         overrides[fname] = _coerce_scalar_or_float_range(raw, field_name=fname)
+    raw = _mapping_get(sec, "min_scene_clearance_frac")
+    if raw is not None:
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            raise TypeError(
+                "min_scene_clearance_frac: expected float, got "
+                f"{type(raw).__name__}"
+            )
+        overrides["min_scene_clearance_frac"] = float(raw)
     return replace(base, **overrides) if overrides else base
 
 
@@ -434,12 +489,20 @@ def deformation_config_from_run_config(config: Any) -> DeformationConfig:
         "amplitude_frac_range",
         "twist_max_deg_range",
         "temporal_smooth_range",
+        "drag_sigma_frac_range",
+        "drag_amplitude_frac_range",
+        "inflate_sigma_frac_range",
+        "inflate_amplitude_frac_range",
+        "twist_sigma_frac_range",
     ):
         raw = _mapping_get(sec, fname)
         if raw is None:
             continue
         overrides[fname] = _coerce_scalar_or_float_range(raw, field_name=fname)
-    for fname in ("drag_weight", "inflate_weight", "twist_weight"):
+    for fname in (
+        "drag_weight", "inflate_weight", "twist_weight",
+        "max_inflate_displacement_frac", "inflate_radial_softness",
+    ):
         raw = _mapping_get(sec, fname)
         if raw is None:
             continue
@@ -474,11 +537,16 @@ def occluder_config_from_run_config(config: Any) -> Optional["OccluderConfig"]:
         "sinusoid_frac_range",
         "lifetime_frac_range",
         "appearance_value_range",
+        "color_patch_frac_range",
+        "color_brightness_range",
     ):
         raw = _mapping_get(sec, fname)
         if raw is None:
             continue
         overrides[fname] = _coerce_scalar_or_float_range(raw, field_name=fname)
+    raw = _mapping_get(sec, "sample_color_from_image")
+    if raw is not None:
+        overrides["sample_color_from_image"] = bool(raw)
 
     for fname in ("appearance_noise_std", "vis_alpha_threshold"):
         raw = _mapping_get(sec, fname)
@@ -571,12 +639,15 @@ class PseudoGTGenerator:
         occluders: Optional[OccluderConfig] = None,
         seed: Optional[int] = None,
         randomize_trajectory: bool = True,
-        visibility_z_tol_frac: float = 0.08,
+        visibility_z_tol_frac: float = 0.04,
         visibility_z_abs_min: float = 1e-3,
-        visibility_depth_dilate: int = 5,
-        visibility_query_patch_rad: int = 1,
+        visibility_depth_dilate: int = 1,
+        visibility_query_patch_rad: int = 0,
         visibility_temporal_window: int = 3,
+        visibility_splat_rad: int = 1,
+        visibility_respect_frame_valid: bool = True,
         frame_valid_erode_px: int = 0,
+        novel_view_median_kernel: int = 7,
     ) -> PseudoGTResult:
         """Generate pseudo-GT tracks from a single image + geometry.
 
@@ -656,6 +727,11 @@ class PseudoGTGenerator:
 
         # ── trajectory + deformation ────────────────────────────────────
         poses = self._build_trajectory(trajectory, rng_traj, dev)  # [T, 4, 4]
+        poses = PseudoGTGenerator._clamp_trajectory_to_scene(
+            poses,
+            X0[0, :3, :],          # [3, N]
+            min_clearance_frac=float(trajectory.min_scene_clearance_frac),
+        )
         deform_fn = self._build_deformation(
             deformation, X0[:, :3, :], T, rng, dev
         )
@@ -679,7 +755,7 @@ class PseudoGTGenerator:
                 Xt, C0, intrinsics, Pt,
                 points_match_3d=Qt,
                 return_mask=True,
-                median_kernel_size=5,
+                median_kernel_size=novel_view_median_kernel,
             )
 
             Pt_inv = torch.inverse(Pt)
@@ -695,6 +771,7 @@ class PseudoGTGenerator:
                 z_abs_min=visibility_z_abs_min,
                 dilate_k=visibility_depth_dilate,
                 query_patch_rad=visibility_query_patch_rad,
+                splat_rad=visibility_splat_rad,
             )
 
             all_frames.append(proj_out["warped"])
@@ -721,6 +798,16 @@ class PseudoGTGenerator:
             frame_valid_stack, frame_valid_erode_px
         )
 
+        # Fold the novel-view holemask into the visibility GT: a query
+        # whose projected pixel lands in a rendering hole (frame_valid == 0)
+        # cannot be a reliable positive because the RGB there is either
+        # black or median-inpainted garbage — mark it occluded.
+        if visibility_respect_frame_valid:
+            vis_stack = PseudoGTGenerator._mask_visibility_by_frame_valid(
+                vis_stack, frame_valid_stack,
+                tracks=torch.cat(all_tracks, dim=0),
+            )
+
         frames_stack = torch.cat(all_frames, dim=0)  # [T, 3, H, W]
         tracks_stack = torch.cat(all_tracks, dim=0)  # [T, Q, 2]
 
@@ -732,6 +819,7 @@ class PseudoGTGenerator:
                     visibility=vis_stack,
                     frame_valid=frame_valid_stack,
                     cfg=occluders,
+                    source_image=image,
                     rng=rng,
                     device=dev,
                 )
@@ -856,6 +944,97 @@ class PseudoGTGenerator:
 
         return speed.clamp(min=0.02)
 
+    @staticmethod
+    def _clamp_trajectory_to_scene(
+        poses: torch.Tensor,            # [T, 4, 4] cam-to-world in src-cam frame
+        cloud_xyz: torch.Tensor,        # [3, N] in src-cam frame
+        min_clearance_frac: float,
+        n_subsample: int = 2048,
+        n_bisect_iter: int = 20,
+    ) -> torch.Tensor:
+        r"""Globally scale translations so the camera never enters the cloud.
+
+        The source camera is at the origin, so the initial clearance is
+        ``z_min = min_i ||cloud[i]||``.  The target clearance is
+        ``thr = min_clearance_frac * z_min``.  We bisect a scalar
+        ``s in (0, 1]`` applied to every frame's translation:
+
+        .. math::
+
+            s^{*} = \max \{ s \in (0, 1]\; : \; \min_{t, i} \| c_i - s \cdot \tau_t \| \ge \mathrm{thr} \}.
+
+        Scaling is uniform to preserve the trajectory's *shape* (only the
+        amplitude shrinks) and to keep the motion recognisable.  Rotations
+        are untouched.
+
+        Subsamples the cloud to ``n_subsample`` points (uniform at random)
+        for the pairwise distance call to stay cheap even for full-frame
+        clouds with ``N ≈ H·W ≈ 2·10^5``.
+        """
+        if min_clearance_frac <= 0.0:
+            return poses
+        T = poses.shape[0]
+        dev = poses.device
+        N = cloud_xyz.shape[1]
+
+        if N > n_subsample:
+            idx = torch.randint(0, N, (n_subsample,), device=dev)
+            cloud_s = cloud_xyz[:, idx].T  # [M, 3]
+        else:
+            cloud_s = cloud_xyz.T  # [N, 3]
+
+        z_min = cloud_s.norm(dim=1).min().item()
+        thr = float(min_clearance_frac) * float(z_min)
+
+        orig_trans = poses[:, :3, 3].clone()  # [T, 3]
+
+        def worst_dist(scale: float) -> float:
+            cam = scale * orig_trans  # [T, 3]
+            d = torch.cdist(cam.unsqueeze(0), cloud_s.unsqueeze(0)).squeeze(0)
+            return d.min().item()
+
+        if worst_dist(1.0) >= thr:
+            return poses  # nothing to do
+
+        # Bisect in [0, 1] for the largest s such that worst_dist(s) >= thr.
+        # s = 0 always yields worst_dist = z_min >= thr by construction.
+        s_lo, s_hi = 0.0, 1.0
+        for _ in range(n_bisect_iter):
+            s_mid = 0.5 * (s_lo + s_hi)
+            if worst_dist(s_mid) >= thr:
+                s_lo = s_mid
+            else:
+                s_hi = s_mid
+        scale = max(s_lo, 1e-3)
+
+        poses = poses.clone()
+        poses[:, :3, 3] = scale * orig_trans
+        return poses
+
+    @staticmethod
+    def _mask_visibility_by_frame_valid(
+        vis: torch.Tensor,           # [T, Q] bool
+        frame_valid: torch.Tensor,   # [T, 1, H, W] float in [0, 1]
+        tracks: torch.Tensor,        # [T, Q, 2] pixel coords (x, y)
+        threshold: float = 0.5,
+    ) -> torch.Tensor:
+        """AND visibility with ``frame_valid >= threshold`` sampled at each track.
+
+        Novel-view pixels that ended up as holes (``frame_valid == 0``) are
+        rendered either black or with median-inpainted garbage — any query
+        projecting there cannot be a reliable visibility positive, so we
+        flip it to False.
+        """
+        T, _, H, W = frame_valid.shape
+        gx = 2.0 * tracks[..., 0].clamp(0, max(W - 1, 1)) / max(W - 1, 1) - 1.0
+        gy = 2.0 * tracks[..., 1].clamp(0, max(H - 1, 1)) / max(H - 1, 1) - 1.0
+        grid = torch.stack([gx, gy], dim=-1).unsqueeze(2)  # [T, Q, 1, 2]
+        v_at_q = F.grid_sample(
+            frame_valid, grid, mode='bilinear',
+            padding_mode='zeros', align_corners=True,
+        ).squeeze(1).squeeze(-1)  # [T, Q]
+        return vis & (v_at_q >= threshold)
+
     # ── deformation ─────────────────────────────────────────────────────
 
     @staticmethod
@@ -869,7 +1048,12 @@ class PseudoGTGenerator:
         """Build a deformation closure ``fn(X, t) -> X_def``.
 
         The returned callable accepts ``X  [1, 3or4, N]`` and an integer
-        frame index ``t`` and returns a deformed copy.
+        frame index ``t`` and returns a deformed copy.  Type is sampled
+        first so sigma / amplitude can use per-type overrides from ``cfg``
+        (e.g. big-smooth-low-amplitude inflations + small-strong twists).
+        Inflation peak displacement is additionally hard-clamped to
+        ``cfg.max_inflate_displacement_frac * extent`` to prevent
+        screen-space tearing.
         """
         K = _sample_i(rng, cfg.n_deformers_range, device)
         if K == 0:
@@ -884,17 +1068,7 @@ class PseudoGTGenerator:
         idx = torch.randint(0, N, (K,), device=device, generator=rng)
         centres = xyz[:, idx].T  # [K, 3]
 
-        # per-deformer parameters ------------------------------------------------
-        sigmas = torch.tensor(
-            [extent * _sample_f(rng, cfg.sigma_frac_range, device) for _ in range(K)],
-            device=device,
-        )  # [K]
-        amplitudes = torch.tensor(
-            [extent * _sample_f(rng, cfg.amplitude_frac_range, device) for _ in range(K)],
-            device=device,
-        )  # [K]
-
-        # type assignment via weighted categorical  (0=drag, 1=inflate, 2=twist)
+        # ── sample type first so per-type sigma/amp can be used ─────────
         total_w = cfg.drag_weight + cfg.inflate_weight + cfg.twist_weight
         p_drag = cfg.drag_weight / total_w
         p_infl = cfg.inflate_weight / total_w
@@ -907,6 +1081,32 @@ class PseudoGTGenerator:
                 types[k] = 1
             else:
                 types[k] = 2
+
+        # per-type range lookup with fallback to shared range
+        sigma_ranges = (
+            cfg.drag_sigma_frac_range or cfg.sigma_frac_range,     # drag
+            cfg.inflate_sigma_frac_range or cfg.sigma_frac_range,  # inflate
+            cfg.twist_sigma_frac_range or cfg.sigma_frac_range,    # twist
+        )
+        amp_ranges = (
+            cfg.drag_amplitude_frac_range or cfg.amplitude_frac_range,     # drag
+            cfg.inflate_amplitude_frac_range or cfg.amplitude_frac_range,  # inflate
+            cfg.amplitude_frac_range,  # twist — strength driven by twist_max_deg_range
+        )
+
+        sigma_list: List[float] = []
+        amp_list: List[float] = []
+        max_inflate_disp = float(cfg.max_inflate_displacement_frac) * extent
+        for k in range(K):
+            tk = int(types[k].item())
+            sigma_list.append(extent * _sample_f(rng, sigma_ranges[tk], device))
+            amp = extent * _sample_f(rng, amp_ranges[tk], device)
+            if tk == 1:  # inflate — cap amplitude to avoid pixel holes
+                amp = min(amp, max_inflate_disp)
+            amp_list.append(amp)
+
+        sigmas = torch.tensor(sigma_list, device=device, dtype=torch.float32)
+        amplitudes = torch.tensor(amp_list, device=device, dtype=torch.float32)
 
         drag_dir = F.normalize(
             torch.randn(K, 3, device=device, generator=rng), dim=1
@@ -924,6 +1124,9 @@ class PseudoGTGenerator:
 
         t_smooth = _sample_f(rng, cfg.temporal_smooth_range, device)
         profiles = _make_temporal_profiles(K, T, t_smooth, rng, device)  # [K, T]
+
+        # softened-radial epsilon for inflate: eps = soft_frac * extent
+        radial_eps = float(cfg.inflate_radial_softness) * max(extent, 1e-6)
 
         # ── closure ----------------------------------------------------------
 
@@ -949,8 +1152,13 @@ class PseudoGTGenerator:
                         scale_k.unsqueeze(0) * drag_dir[k].unsqueeze(1)
                     ).unsqueeze(0)  # [1, 3, M]
 
-                elif types[k] == 1:  # inflate / deflate
-                    radial = F.normalize(diff[k], dim=1)  # [M, 3]
+                elif types[k] == 1:  # inflate / deflate — softened radial
+                    # d / sqrt(||d||^2 + eps^2) instead of d / ||d||:
+                    # bounded direction near the centre → no spike, plus
+                    # the magnitude grows smoothly from 0 at the centre,
+                    # avoiding the tiny near-singularity dense region.
+                    denom = torch.sqrt(dist_sq[k] + radial_eps ** 2).unsqueeze(1)  # [M, 1]
+                    radial = diff[k] / denom  # [M, 3]
                     disp = disp + (
                         scale_k.unsqueeze(1) * radial
                     ).T.unsqueeze(0)  # [1, 3, M]
@@ -982,12 +1190,55 @@ class PseudoGTGenerator:
     # ── synthetic occluders ─────────────────────────────────────────────
 
     @staticmethod
+    def _sample_occluder_colors(
+        source_image: torch.Tensor,   # [1, 3, H, W] in [0, 1]
+        cfg: "OccluderConfig",
+        K: int,
+        rng: torch.Generator,
+        device,
+    ) -> torch.Tensor:
+        """Per-occluder base RGB in ``[0, 1]^3`` of shape ``[K, 3]``.
+
+        When ``cfg.sample_color_from_image`` is True each colour is the
+        mean of a random square patch of the source image, multiplied by
+        a brightness jitter sampled from ``cfg.color_brightness_range``.
+        This keeps occluders inside the dataset's colour manifold (no
+        out-of-domain blue sprites on red tissue).  Otherwise falls back
+        to the legacy uniform sampler bounded by
+        ``cfg.appearance_value_range``.
+        """
+        if not getattr(cfg, "sample_color_from_image", False):
+            return torch.stack([
+                torch.tensor(
+                    [_sample_f(rng, cfg.appearance_value_range, device) for _ in range(3)],
+                    device=device, dtype=torch.float32,
+                )
+                for _ in range(K)
+            ])  # [K, 3]
+
+        _, _, H, W = source_image.shape
+        min_dim = float(min(H, W))
+
+        colors = torch.empty(K, 3, device=device, dtype=torch.float32)
+        for k in range(K):
+            patch_frac = _sample_f(rng, cfg.color_patch_frac_range, device)
+            patch_size = max(2, int(round(patch_frac * min_dim)))
+            cy = _uniform_int(rng, 0, max(H - patch_size, 0), device)
+            cx = _uniform_int(rng, 0, max(W - patch_size, 0), device)
+            patch = source_image[0, :, cy:cy + patch_size, cx:cx + patch_size]
+            color = patch.reshape(3, -1).mean(dim=1)  # [3]
+            brightness = _sample_f(rng, cfg.color_brightness_range, device)
+            colors[k] = (color * brightness).clamp(0.0, 1.0)
+        return colors
+
+    @staticmethod
     def _apply_occluders(
         frames: torch.Tensor,        # [T, 3, H, W] float in [0, 1]
         tracks: torch.Tensor,        # [T, Q, 2] pixel coords (x, y)
         visibility: torch.Tensor,    # [T, Q] bool
         frame_valid: torch.Tensor,   # [T, 1, H, W] float
         cfg: "OccluderConfig",
+        source_image: torch.Tensor,  # [1, 3, H, W] RGB in [0, 1]
         rng: torch.Generator,
         device,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1050,13 +1301,9 @@ class PseudoGTGenerator:
                          device=device, dtype=torch.float32)
             for _ in range(K)
         ])  # [K]
-        base_rgb = torch.stack([
-            torch.tensor(
-                [_sample_f(rng, cfg.appearance_value_range, device) for _ in range(3)],
-                device=device, dtype=torch.float32,
-            )
-            for _ in range(K)
-        ])  # [K, 3]
+        base_rgb = PseudoGTGenerator._sample_occluder_colors(
+            source_image=source_image, cfg=cfg, K=K, rng=rng, device=device,
+        )  # [K, 3]
 
         # Start / end pixel centres (allow sliding from slightly off-screen).
         margin = 0.15 * min_dim
@@ -1228,12 +1475,51 @@ class PseudoGTGenerator:
         K: torch.Tensor,  # [1, 3, 3]
         H: int,
         W: int,
-        z_tol_frac: float = 0.08,
+        z_tol_frac: float = 0.04,
         z_abs_min: float = 1e-3,
-        dilate_k: int = 5,
-        query_patch_rad: int = 1,
+        dilate_k: int = 1,
+        query_patch_rad: int = 0,
+        splat_rad: int = 1,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Float z-buffer visibility + debug RGB overlay ``[1, H, W, 3]`` uint8."""
+        r"""Float z-buffer visibility + debug RGB overlay ``[1, H, W, 3]`` uint8.
+
+        Strategy
+        --------
+        For every 3-D cloud point ``c_i`` with camera-frame depth ``z_i``
+        we **splat to a ``(2·splat_rad+1)²`` pixel neighbourhood** around
+        its projected pixel with ``scatter_reduce(amin)`` on ``z_i``.  This
+        drastically reduces z-buffer holes caused by the "one point per
+        pixel" undersampling (after projection + rotation + deformation
+        the source cloud no longer covers every output pixel, especially
+        for inflations where point spacing grows).
+
+        A query ``q`` with depth ``z_q`` projecting to pixel ``(u_q, v_q)``
+        is declared **visible** iff:
+
+        .. math::
+
+            z_q > 0 \;\land\; z_q \le \mathrm{zbuf}(u_q, v_q) + \max(\tau_{\mathrm{frac}} \cdot |z_q|, \tau_{\mathrm{abs}})
+
+        i.e. ``q`` is at most ``z_tol`` behind the *nearest* splat over
+        that pixel (small positive slack absorbs splat quantisation).
+
+        Differences vs. the pre-fix implementation:
+
+        1. **Multi-pixel splat** (``splat_rad=1`` → 3×3) instead of one
+           pixel + 5×5 min-pool dilation.  Min-pool dilation *leaked*
+           near-field depths into neighbouring background pixels, causing
+           spurious occlusions at depth discontinuities (queries near the
+           edges of closer surfaces were flagged occluded even though no
+           surface is actually in front of them).
+        2. **No query neighbourhood min** (``query_patch_rad=0`` default).
+           The old 3×3 patch at the query combined with the 5×5 dilation
+           created a 7×7 "nearest depth hunt" that grabbed foreground
+           from far away — too conservative.
+        3. **Bilinear zbuf lookup** at the query's subpixel coordinate
+           when ``query_patch_rad <= 0``.  Eliminates the integer-round
+           jitter that made visibility flicker frame-to-frame on queries
+           sitting between pixel centres.
+        """
         dev = cloud_cam.device
         B = 1
 
@@ -1241,22 +1527,70 @@ class PseudoGTGenerator:
         uv_c = proj_c[:, :2, :] / proj_c[:, 2:3, :].clamp(min=1e-6)
         z_c = cloud_cam[:, 2, :]  # [1, N]
 
-        u_c = uv_c[:, 0, :].round().long().clamp(0, W - 1)
-        v_c = uv_c[:, 1, :].round().long().clamp(0, H - 1)
-        lin_c = v_c * W + u_c  # [1, N]
+        u_c0 = uv_c[:, 0, :].round().long()
+        v_c0 = uv_c[:, 1, :].round().long()
 
-        zbuf_min = torch.full((B, H * W), float("inf"), device=dev)
-        zbuf_min.scatter_reduce_(1, lin_c, z_c, reduce="amin", include_self=True)
+        # Multi-pixel splat with scatter_reduce(amin).  Build
+        # (lin_idx, z_value) pairs of shape [B, N * Ks] by replicating each
+        # point across its splat neighbourhood; out-of-bounds / behind-camera
+        # entries are masked to +inf so they never win the amin reduce.
+        splat_rad = max(int(splat_rad), 0)
+        if splat_rad == 0:
+            offs_u = torch.zeros(1, device=dev, dtype=torch.long)
+            offs_v = torch.zeros(1, device=dev, dtype=torch.long)
+        else:
+            r = splat_rad
+            ax = torch.arange(-r, r + 1, device=dev, dtype=torch.long)
+            offs_v, offs_u = torch.meshgrid(ax, ax, indexing="ij")
+            offs_u = offs_u.reshape(-1)
+            offs_v = offs_v.reshape(-1)
+        Ks = offs_u.numel()
 
-        zbuf_max = torch.full((B, H * W), 0.0, device=dev)
-        zbuf_max.scatter_reduce_(1, lin_c, z_c, reduce="amax", include_self=True)
-        hit_count = torch.zeros(B, H * W, device=dev)
-        hit_count.scatter_reduce_(
-            1, lin_c, torch.ones_like(z_c), reduce="sum", include_self=False
+        uu = u_c0.unsqueeze(-1) + offs_u.view(1, 1, -1)  # [B, N, Ks]
+        vv = v_c0.unsqueeze(-1) + offs_v.view(1, 1, -1)  # [B, N, Ks]
+        in_bounds_c = (uu >= 0) & (uu < W) & (vv >= 0) & (vv < H)
+        uu = uu.clamp(0, W - 1)
+        vv = vv.clamp(0, H - 1)
+        lin = (vv * W + uu).reshape(B, -1)                          # [B, N*Ks]
+        z_rep = z_c.unsqueeze(-1).expand(-1, -1, Ks).reshape(B, -1)  # [B, N*Ks]
+        INF = float("inf")
+        z_rep = torch.where(
+            in_bounds_c.reshape(B, -1) & (z_rep > 0),
+            z_rep,
+            torch.full_like(z_rep, INF),
         )
 
+        zbuf_min = torch.full((B, H * W), INF, device=dev)
+        zbuf_min.scatter_reduce_(1, lin, z_rep, reduce="amin", include_self=True)
+
+        # Optional extra dilation: only active when ``dilate_k > 1``.
+        dilate_k = max(int(dilate_k), 1)
+        if dilate_k % 2 == 0:
+            dilate_k += 1
+        zbuf_2d = zbuf_min.view(B, 1, H, W)
+        if dilate_k > 1:
+            pad = dilate_k // 2
+            zbuf_2d = -F.max_pool2d(
+                -zbuf_2d, kernel_size=dilate_k, stride=1, padding=pad,
+            )
+        zbuf = zbuf_2d.view(B, H * W)
+
+        # Debug overlay: red = no splat, yellow = conflicting depths at pixel,
+        # green = consistent coverage.
+        finite_mask = (z_rep < INF).float()
+        hit_count = torch.zeros(B, H * W, device=dev)
+        hit_count.scatter_reduce_(
+            1, lin, finite_mask, reduce="sum", include_self=False,
+        )
+        zbuf_max = torch.full((B, H * W), 0.0, device=dev)
+        z_rep_finite = torch.where(
+            z_rep < INF, z_rep, torch.zeros_like(z_rep)
+        )
+        zbuf_max.scatter_reduce_(
+            1, lin, z_rep_finite, reduce="amax", include_self=True,
+        )
         gap_mask = hit_count < 0.5
-        spread = (zbuf_max - zbuf_min).abs()
+        spread = (zbuf_max - zbuf_min.clamp(max=1e6)).abs()
         med_z = zbuf_min.clamp(min=1e-6)
         conflict_mask = (~gap_mask) & (spread > z_tol_frac * med_z)
 
@@ -1270,25 +1604,9 @@ class PseudoGTGenerator:
         )
         zbuf_debug = dbg.view(B, H, W, 3)
 
-        dilate_k = max(int(dilate_k), 1)
-        if dilate_k % 2 == 0:
-            dilate_k += 1
-        zbuf_2d = zbuf_min.view(B, 1, H, W)
-        pad = dilate_k // 2
-        zbuf_2d = -F.max_pool2d(
-            -zbuf_2d, kernel_size=dilate_k, stride=1, padding=pad
-        )
-        zbuf = zbuf_2d.view(B, H * W)
-
         proj_q = torch.bmm(K, query_cam[:, :3, :])  # [1, 3, Q]
         uv_q = proj_q[:, :2, :] / proj_q[:, 2:3, :].clamp(min=1e-6)
         z_q = query_cam[:, 2, :]  # [1, Q]
-
-        u_q = uv_q[:, 0, :].round().long().clamp(0, W - 1)
-        v_q = uv_q[:, 1, :].round().long().clamp(0, H - 1)
-        zbuf_at_q = PseudoGTGenerator._query_neighborhood_zbuf_min(
-            zbuf, H, W, u_q, v_q, query_patch_rad
-        )
 
         in_bounds = (
             (uv_q[:, 0, :] >= 0)
@@ -1296,6 +1614,34 @@ class PseudoGTGenerator:
             & (uv_q[:, 1, :] >= 0)
             & (uv_q[:, 1, :] < H)
         )
+
+        if query_patch_rad > 0:
+            u_q = uv_q[:, 0, :].round().long().clamp(0, W - 1)
+            v_q = uv_q[:, 1, :].round().long().clamp(0, H - 1)
+            zbuf_at_q = PseudoGTGenerator._query_neighborhood_zbuf_min(
+                zbuf, H, W, u_q, v_q, query_patch_rad,
+            )
+        else:
+            # Bilinear lookup on a "safe" zbuf (finite in-bounds, large at
+            # holes).  We use a large sentinel (1e9) in place of +inf so
+            # grid_sample's linear interpolation stays finite, then restore
+            # +inf afterwards to keep "no splat nearby" queries occluded.
+            zbuf_safe = torch.where(
+                torch.isinf(zbuf), torch.full_like(zbuf, 1e9), zbuf,
+            ).view(B, 1, H, W)
+            gx = 2.0 * uv_q[:, 0, :].clamp(0, W - 1) / max(W - 1, 1) - 1.0
+            gy = 2.0 * uv_q[:, 1, :].clamp(0, H - 1) / max(H - 1, 1) - 1.0
+            grid = torch.stack([gx, gy], dim=-1).unsqueeze(2)  # [B, Q, 1, 2]
+            zbuf_at_q = F.grid_sample(
+                zbuf_safe, grid, mode="bilinear",
+                padding_mode="border", align_corners=True,
+            ).squeeze(1).squeeze(-1)  # [B, Q]
+            zbuf_at_q = torch.where(
+                zbuf_at_q > 1e8,
+                torch.full_like(zbuf_at_q, INF),
+                zbuf_at_q,
+            )
+
         z_tol = torch.maximum(
             z_tol_frac * z_q.abs(),
             z_q.new_tensor(z_abs_min),

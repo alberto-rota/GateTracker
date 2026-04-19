@@ -27,7 +27,7 @@ parameters:
   IMAGE_WIDTH:
     value: 448
   BATCH_SIZE:
-    value: 16
+    value: 32
   # singlegpu | dp | ddp (CLI ``--ddp`` / ``--dp`` / ``--single`` overrides this)
   DISTRIBUTE:
     value: "singlegpu"
@@ -41,7 +41,7 @@ parameters:
   SHUFFLE:
     value: True
   WORKERS:
-    value: 6
+    value: 8
   PIN_MEMORY:
     value: True
   PREFETCH_FACTOR:
