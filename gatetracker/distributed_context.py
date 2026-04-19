@@ -62,6 +62,21 @@ def is_main_process() -> bool:
     return get_rank() == 0
 
 
+def ddp_find_unused_parameters(config: Any) -> bool:
+    """``DistributedDataParallel(find_unused_parameters=...)``.
+
+    Default ``False`` avoids an extra autograd traversal each iteration when
+    every parameter participates in the forward pass. Set
+    ``DDP_FIND_UNUSED_PARAMETERS: true`` in YAML if a branch sometimes skips
+    subgraphs (e.g. optional heads).
+    """
+    v = _cfg_get(config, "DDP_FIND_UNUSED_PARAMETERS", False)
+    if isinstance(v, bool):
+        return v
+    s = str(v).strip().lower()
+    return s in ("true", "1", "yes")
+
+
 def unwrap_model(model: nn.Module) -> nn.Module:
     """Strip DistributedDataParallel / DataParallel / DataParallel-style wrappers."""
     m = model

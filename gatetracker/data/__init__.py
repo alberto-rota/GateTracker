@@ -13,12 +13,15 @@ from dataset.utils import adapt_intrinsics_two_step, split_videos, resize_intrin
 from dataset.sequence_sampler import SequenceWindowDataset
 from dataset.stereomis_tracking import StereoMISTracking
 from dataset.stereomis_tracking_windowed import StereoMISTrackingWindowed
+from dataset.stir_tracking import STIRTracking
 from gatetracker.data.pseudo_gt import (
     PseudoGTGenerator,
     TrajectoryConfig,
     DeformationConfig,
     GridConfig,
     PseudoGTResult,
+    deformation_config_from_run_config,
+    trajectory_config_from_run_config,
 )
 
 __all__ = [
@@ -32,9 +35,12 @@ __all__ = [
     "SequenceWindowDataset",
     "StereoMISTracking",
     "StereoMISTrackingWindowed",
+    "STIRTracking",
     "PseudoGTGenerator",
     "TrajectoryConfig",
     "DeformationConfig",
     "GridConfig",
     "PseudoGTResult",
+    "deformation_config_from_run_config",
+    "trajectory_config_from_run_config",
 ]

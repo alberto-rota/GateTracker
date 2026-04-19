@@ -149,7 +149,12 @@ class TemporalRefinementNetwork(nn.Module):
     # for ``sampled``). We chunk along the query axis to stay well below
     # both limits while preserving exact equivalence (per-point op is
     # independent across queries).
-    _GRID_SAMPLE_MAX_ELEMENTS: int = 1 << 28  # 2.7e8 elements per chunk
+    #
+    # During autograd, many chunks' activations coexist in the graph, and a
+    # second refinement forward (cycle loss) stacks further peaks — keep this
+    # budget conservative so each ``sampled`` slab stays smaller (helps both
+    # allocator fragmentation and peak VRAM).
+    _GRID_SAMPLE_MAX_ELEMENTS: int = 1 << 24  # 16_777_216 elements per chunk
 
     def _extract_local_correlation(
         self,

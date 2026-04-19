@@ -20,16 +20,23 @@ parameters:
     value: "swept-cloud-14"
 
   # ===== DATA =====
+  # Phase-aware splits (optional): PHASES lists which pipeline uses this dataset
+  # (pretrain | tracking). PRETRAIN / TRACKING blocks override TRAIN_VIDEOS /
+  # VAL_VIDEOS / TEST_VIDEOS for that phase. MAX_*_VIDEOS caps list size after patterns.
+  # STIR is eval-only (no Mono3D class): PHASES: [tracking], PATH, CAMERA, COLLECTION_GLOBS.
   IMAGE_HEIGHT:
     value: 448
   IMAGE_WIDTH:
     value: 448
   BATCH_SIZE:
-    value: 16
+    value: 4
   DISTRIBUTE:
     value: "singlegpu"
   DISTBACKEND:
     value: "nccl"
+  # DDP only: set true if forward sometimes skips parameters (optional heads).
+  DDP_FIND_UNUSED_PARAMETERS:
+    value: false
   DDP_SHUFFLE_SEED:
     value: 978654321
   SHUFFLE:
@@ -48,10 +55,10 @@ parameters:
     value:
       SCARED:
         PATH: "SCARED"
-        FPS: 16
+        FPS: 32
         FRAMESKIP: [1, 2, 4, 8, 16, 24, 32]
-        TRAIN_VIDEOS: ["train_v20*"]
-        VAL_VIDEOS: ["test_*"]
+        TRAIN_VIDEOS: ["train_*"]
+        VAL_VIDEOS: [""]
         TEST_VIDEOS: ["test_*"]
         RANDOM_POSE_TRAINING: True
         RANDOM_POSE_RANGES: [2.5, 3.25]
@@ -66,10 +73,10 @@ parameters:
 
       CHOLEC80:
         PATH: "CHOLEC80/videos"
-        FPS: 20
+        FPS: 80
         FRAMESKIP: [1]
-        TRAIN_VIDEOS: ["train_video02"]
-        TEST_VIDEOS: ["test_video*"]
+        TRAIN_VIDEOS: ["train_video*"]
+        TEST_VIDEOS: [""]
         VAL_VIDEOS: ["test_video*"]
         RANDOM_POSE_TRAINING: True
         RANDOM_POSE_RANGES: [2.5, 3.25]
@@ -101,6 +108,22 @@ parameters:
         }
         CROP_ZOOM_FACTOR: 1.2
 
+      STIR:
+        PHASES: ["tracking"]
+        PATH: "STIR_04"
+        CAMERA: "left"
+        COLLECTION_GLOBS: ["*"]
+        FPS: 8
+        FRAMESKIP: [1]
+        TRAIN_VIDEOS: []
+        VAL_VIDEOS: ["*/*/*"]
+        TEST_VIDEOS: ["*/*/*"]
+        RANDOM_POSE_TRAINING: False
+        RANDOM_POSE_RANGES: [2.5, 3.25]
+        CURRICULUM_FACTOR: 1
+        AUGMENTATION_PROBABILITY: { COLOR: 0.0, GEOMETRIC: 0.0, REVERSE: 0.0, STANDSTILL: 0.0 }
+        CROP_ZOOM_FACTOR: 1.0
+
   # ===== BACKBONE =====
   DINO_MODEL_NAME:
     value: "facebook/dinov3-vitl16-pretrain-lvd1689m"
@@ -112,12 +135,16 @@ parameters:
     value: "register_gated_hierarchical"
   FUSION_GATE_TEMPERATURE:
     value: 2.0
+  FUSION_GATE_TEMPERATURE_FINAL:
+    value: 0.5
+  FUSION_GATE_ANNEAL_EPOCHS:
+    value: 10
   FUSION_UNIFORM_MIXING:
-    value: 0.10
+    value: 0.0
   FUSION_LAYER_DROPOUT:
     value: 0.10
   FUSION_GATE_LOGIT_BOUND:
-    value: 1.5
+    value: 8.0
 
   # ===== MATCHING =====
   TRIPLETS_TO_MINE:
@@ -165,9 +192,9 @@ parameters:
 
   # ===== TRACKING FLAGS (pairwise head disabled in pretrain) =====
   TRACKING_MODE:
-    value: False
+    value: True
   TRACKING_HEAD:
-    value: False
+    value: True
 
   # ===== LOSSES =====
   DESCRIPTOR_LOSS:
@@ -180,6 +207,10 @@ parameters:
     value: 0.25
   FINE_REFINEMENT_LOSS_BETA:
     value: 1.0
+  # Entropy-minimization regularizer on fusion gate weights to encourage
+  # layer specialization. 0.0 disables the term.
+  GATE_ENTROPY_WEIGHT:
+    value: 0.05
   LOSS_WEIGHT:
     value: {
       Fundamental: 0.8
@@ -198,12 +229,16 @@ parameters:
     value: 1.0e-5
   LR_FINE_FEATURE:
     value: 1.0e-5
+  # Gate sub-modules are tiny: boost their LR so the gate can track the
+  # descriptor objective faster than the fusion projections.
+  LR_GATE:
+    value: 5.0e-5
   WEIGHT_DECAY:
     value: 0.0
   GRADIENT_ACCUMULATION_STEPS:
     value: 1
   EPOCHS:
-    value: 200
+    value: 50
   WARMUP_STEPS:
     value: 0
   EARLYSTOPPING_PATIENCE:
@@ -248,13 +283,24 @@ parameters:
   TRACKING_BATCH_SIZE:
     value: 16
   TRACKING_SEQUENCE_LENGTH:
-    value: 16
+    value: 32
   TRACKING_NUM_QUERY_POINTS:
-    value: 512
+    value: 128
   TRACKING_WORKERS:
     value: 8
   TRACKING_ENCODER_CHUNK_SIZE:
     value: 16
+  # Step between window **start** frames when indexing training clips (larger
+  # ⇒ fewer batches per epoch). Default when omitted: ``TRACKING_SEQUENCE_LENGTH // 2``.
+  TRACKING_WINDOW_TRAIN_STRIDE:
+    value: 48
+  # Sliding-window visibility fusion: ``min`` is pessimistic (any window doubts
+  # → low vis); ``mean`` is the legacy behaviour.
+  TRACKING_LONGSEQ_VIS_AGG:
+    value: "min"
+  # Optional hard cap on per-frame displacement (pixels); 0 disables.
+  TRACKING_INFER_MAX_STEP_PX:
+    value: 0
 
   # ===== TEMPORAL REFINEMENT NETWORK (architecture) =====
   # Sized for long-horizon reasoning: a 9x9 local correlation window
@@ -283,12 +329,21 @@ parameters:
     value: 1.0
   TEMPORAL_SMOOTHNESS_LOSS_WEIGHT:
     value: 0.5
+  # First-order Huber on ||p_{t+1}-p_t|| (pixels); damps brief outlier jumps that
+  # second-order smoothness can miss when visibility weights are high.
+  TEMPORAL_VELOCITY_HUBER_WEIGHT:
+    value: 0.22
+  TEMPORAL_VELOCITY_HUBER_BETA:
+    value: 6.0
   TEMPORAL_DESC_LOSS_WEIGHT:
     value: 0.75
   TEMPORAL_FEATURE_LOSS_WEIGHT:
     value: 0.75
   TEMPORAL_VIS_REG_WEIGHT:
     value: 0.1
+  # Lower entropy pull so visibility can stay sharp for occlusions (was fixed 0.1 in code).
+  TEMPORAL_VIS_REG_ENTROPY_SCALE:
+    value: 0.04
 
   # ===== TRACKING OPTIMIZER =====
   # ``LEARNING_RATE`` (1e-5) is sized for descriptor pretraining; using it
@@ -299,16 +354,31 @@ parameters:
   LR_TEMPORAL_REFINEMENT_MIN:
     value: 2.0e-6
 
-  # ===== STEREOMIS GT VALIDATION (PHASE=tracking, each val epoch) =====
-  # Requires DATASETS.STEREOMIS.PATH (and optional DATASET_ROOTDIR) so the root resolves.
+  # ===== STEREOMIS / STIR / PSEUDO VAL (PHASE=tracking, each val epoch) =====
+  # StereoMIS: metrics on all VAL_VIDEOS matches; W&B videos for one random seq/epoch.
   TRACKING_STEREOMIS_VAL:
     value: True
-  TRACKING_STEREOMIS_VAL_SEQUENCE:
-    value: "test_P3_1"
   TRACKING_STEREOMIS_VAL_MAX_FRAMES:
     value: null
   TRACKING_STEREOMIS_VAL_GRID:
     value: 20
+  TRACKING_VAL_VIDEO_SEED:
+    value: 424242
+  TRACKING_VAL_RENDER_VIDEOS_ALL_SEQS:
+    value: False
+  TRACKING_STIR_VAL:
+    value: True
+  # One forced novel-view pseudo clip + sparse GT vs pred video (main rank only).
+  TRACKING_VAL_PSEUDO_NOVELVIEW:
+    value: True
+  TRACKING_VAL_PSEUDO_GRID_SIZE:
+    value: 8
+  TRACKING_VAL_PSEUDO_SPARSE_STRIDE:
+    value: 32
+  TRACKING_VAL_PSEUDO_MAX_POINTS:
+    value: 64
+  TRACKING_VAL_PSEUDO_BATCH_INDEX:
+    value: 0
 
   # ===== PSEUDO-GT (novel-view) supervision for PHASE=tracking =====
   # Hybrid training: per-step Bernoulli(PSEUDO_GT_MIX) replaces the window with pseudo
@@ -328,6 +398,28 @@ parameters:
     value: 0.03
   PSEUDO_GT_MASK_ERODE_PX:
     value: 0
+  # Stochastic camera path + scene deformation for :class:`PseudoGTGenerator`.
+  # ``n_frames`` is always the batch window length ``T`` (``TRACKING_SEQUENCE_LENGTH``);
+  # any ``n_frames`` key here is ignored.
+  PSEUDO_GT_TRAJECTORY:
+    value:
+      z_bias_range: [-0.1, 0.1]
+      complexity_range: [0.3, 0.7]
+      translation_range: [0.02, 0.08]
+      rotation_range_deg: [2.0, 8.0]
+      forward_bias_range: [0.005, 0.025]
+      speed_scale_range: [0.5, 1.5]
+      still_fraction_range: [0.0, 0.15]
+  PSEUDO_GT_DEFORMATION:
+    value:
+      n_deformers_range: [2, 5]
+      sigma_frac_range: [0.08, 0.25]
+      amplitude_frac_range: [0.005, 0.03]
+      drag_weight: 0.5
+      inflate_weight: 0.3
+      twist_weight: 0.2
+      twist_max_deg_range: [1.0, 5.0]
+      temporal_smooth_range: [2.0, 6.0]
   PSEUDO_GT_VIS_APPEARANCE_AWARE:
     value: False
   PSEUDO_GT_SYNTH_SELF_SUP_SCALE:
@@ -335,6 +427,9 @@ parameters:
   TEMPORAL_SUP_POS_WEIGHT:
     value: 1.0
   TEMPORAL_SUP_VIS_WEIGHT:
-    value: 1.0
+    value: 3.0
+  # Extra weight on BCE for occluded (target 0) frames vs visible frames.
+  TEMPORAL_SUP_VIS_OCC_WEIGHT:
+    value: 2.5
   TEMPORAL_SUP_HUBER_BETA:
     value: 1.0

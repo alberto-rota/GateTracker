@@ -11,6 +11,19 @@ from utilities.formatting import align, strip_rich_markup
 from typing import Optional, Any, Union,Dict
 
 
+def _console_emit_allowed(levelno: int) -> bool:
+    try:
+        from gatetracker.distributed_context import dist_initialized, is_main_process
+
+        if not dist_initialized():
+            return True
+        if is_main_process():
+            return True
+        return levelno >= logging.WARNING
+    except Exception:
+        return True
+
+
 class LogContext(Enum):
     """
     Enumeration of logging contexts for consistent categorization of log messages.
@@ -124,6 +137,8 @@ class CustomLogger:
         class CustomRichHandler(RichHandler):
             def emit(self, record: logging.LogRecord) -> None:
                 """Emit a log record with custom formatting."""
+                if not _console_emit_allowed(record.levelno):
+                    return
                 # Skip the usual formatting and just use our custom message
                 record.message = record.getMessage()
                 self.console.print(record.message)
@@ -285,6 +300,8 @@ class CustomLogger:
             style: Style to apply to the printed content
             **kwargs: Additional kwargs for rich Console.print()
         """
+        if not _console_emit_allowed(logging.INFO):
+            return
         time_str = datetime.now().strftime("%H:%M:%S")
         prefix = f"[{time_str}] "
 

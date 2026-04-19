@@ -224,6 +224,7 @@ def render_comparison_video(
     trail_length: int = 20,
     point_radius: int = 3,
     visibility: torch.Tensor | None = None,
+    pred_visibility: torch.Tensor | None = None,
     errors: torch.Tensor | None = None,
     error_max_px: float = 16.0,
     gt_color: tuple[int, int, int] = (255, 255, 255),
@@ -242,8 +243,10 @@ def render_comparison_video(
         fps: Output video frame rate.
         trail_length: Number of past frames to draw as trail.
         point_radius: Radius of current-position circles.
-        visibility: Optional [N, T] bool tensor (GT visibility). Both GT and
-            predicted tracks are hidden when visibility is False.
+        visibility: Optional [N, T] bool tensor (GT visibility). GT geometry is
+            hidden when GT visibility is False.
+        pred_visibility: Optional [N, T] bool tensor. When set, predicted trails
+            and points are hidden when this mask is False (independent of GT).
         errors: Optional [N, T] float tensor of per-point per-frame L2 pixel
             errors used for predicted track coloring. Computed automatically
             from the two trajectories if not provided.
@@ -259,6 +262,10 @@ def render_comparison_video(
     vis_np = None
     if visibility is not None:
         vis_np = visibility.bool().cpu().numpy()  # [N, T]
+
+    pred_vis_np = None
+    if pred_visibility is not None:
+        pred_vis_np = pred_visibility.bool().cpu().numpy()  # [N, T]
 
     pred_np = pred_trajectories.cpu().numpy()  # [T, N, 2]
     gt_np = gt_trajectories.cpu().numpy()      # [T, N, 2]
@@ -328,6 +335,10 @@ def render_comparison_video(
                 pp2 = pred_traj[1:].round().astype("int32")
                 for k in range(pp1.shape[0]):
                     seg_t = t_start + k
+                    if pred_vis_np is not None and (
+                        not pred_vis_np[i, seg_t] or not pred_vis_np[i, seg_t + 1]
+                    ):
+                        continue
                     if vis_np is not None and (
                         not vis_np[i, seg_t] or not vis_np[i, seg_t + 1]
                     ):
@@ -344,23 +355,24 @@ def render_comparison_video(
                         cv2.LINE_AA,
                     )
 
-            px, py = pred_np[t, i, :]
-            cv2.circle(
-                frame_bgr,
-                (int(round(px)), int(round(py))),
-                point_radius,
-                pred_color,
-                -1,
-                cv2.LINE_AA,
-            )
-            cv2.circle(
-                frame_bgr,
-                (int(round(px)), int(round(py))),
-                point_radius,
-                (0, 0, 0),
-                1,
-                cv2.LINE_AA,
-            )
+            if pred_vis_np is None or pred_vis_np[i, t]:
+                px, py = pred_np[t, i, :]
+                cv2.circle(
+                    frame_bgr,
+                    (int(round(px)), int(round(py))),
+                    point_radius,
+                    pred_color,
+                    -1,
+                    cv2.LINE_AA,
+                )
+                cv2.circle(
+                    frame_bgr,
+                    (int(round(px)), int(round(py))),
+                    point_radius,
+                    (0, 0, 0),
+                    1,
+                    cv2.LINE_AA,
+                )
 
         cv2.putText(
             frame_bgr,

@@ -1,6 +1,8 @@
 # -------------------------------------------------------------------------------------------------#
 # Multi-GPU (DDP): torchrun --standalone --nproc_per_node=4 train.py -c pretrain.yaml --ddp
 # Effective batch size ≈ BATCH_SIZE × world_size (each rank uses BATCH_SIZE).
+# Export OMP_NUM_THREADS=1 (and peers) in the shell or .sbatch_scripts before torchrun
+# to avoid the launcher OMP banner; train also applies setdefaults after .env load.
 
 """Copyright (c) 2024 Asensus Surgical"""
 
@@ -16,6 +18,10 @@ import sys
 _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
+
+from gatetracker.env_bootstrap import setdefault_cpu_thread_env
+
+setdefault_cpu_thread_env()
 
 
 def main():

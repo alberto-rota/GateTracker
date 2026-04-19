@@ -54,6 +54,10 @@ class SequenceWindowDataset(Dataset):
     """Wraps a :class:`Mono3D_Dataset` or :class:`MultiDataset` to yield
     temporal windows of ``T`` consecutive frames instead of frame pairs.
 
+    Window **start** indices along each video segment are spaced by ``stride``
+    (minimum 1) for both ``train`` and ``eval`` modes, so larger strides reduce
+    ``len(dataset)`` and speed up epochs.
+
     Per-item output:
 
     | Key     | Shape            | Description                       |
@@ -76,9 +80,12 @@ class SequenceWindowDataset(Dataset):
         Args:
             base_dataset: A :class:`Mono3D_Dataset` or :class:`MultiDataset`.
             window_size:  Number of consecutive frames per window.
-            stride:       Step between window start indices (eval mode only;
-                          train mode samples randomly).
-            mode:         ``"train"`` (random windows) or ``"eval"`` (tiled).
+            stride:       Step between consecutive window **start** indices when
+                          building the index list (both ``train`` and ``eval``).
+                          Larger stride ⇒ fewer dataset indices ⇒ shorter epochs;
+                          each train ``__getitem__`` still samples uniformly over
+                          that list. Minimum effective stride is ``1``.
+            mode:         ``"train"`` (random windows) or ``"eval"`` (deterministic by idx).
         """
         super().__init__()
         assert mode in ("train", "eval"), f"mode must be 'train' or 'eval', got {mode}"
@@ -102,14 +109,10 @@ class SequenceWindowDataset(Dataset):
                 max_seg_len = max(max_seg_len, seg_len)
                 if seg_len < window_size:
                     continue
-                if mode == "eval":
-                    for ws in range(seg_start, seg_end - window_size + 1, stride):
-                        self._window_starts.append(
-                            (ds_idx, ws, min(ws + window_size, seg_end))
-                        )
-                else:
-                    for ws in range(seg_start, seg_end - window_size + 1):
-                        self._window_starts.append((ds_idx, ws, ws + window_size))
+                st = max(1, int(stride))
+                for ws in range(seg_start, seg_end - window_size + 1, st):
+                    end = min(ws + window_size, seg_end)
+                    self._window_starts.append((ds_idx, ws, end))
 
         if not self._window_starts:
             raise ValueError(

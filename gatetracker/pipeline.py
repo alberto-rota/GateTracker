@@ -68,6 +68,7 @@ def run_pipeline(
 
     from gatetracker.distributed_context import (
         DISTRIBUTE_DDP,
+        DISTRIBUTE_SINGLEGPU,
         fill_ddp_env_into_config,
         init_process_group_from_config,
         normalize_distribute,
@@ -133,7 +134,14 @@ def run_pipeline(
         config.FEWFRAMES = True
 
     try:
-        result = initialize_from_config(config, inference=(mode == "test"), verbose=True)
+        _phase = str(config.get("PHASE", "pretrain")).lower()
+        _ds_phase = "tracking" if _phase == "tracking" else "pretrain"
+        result = initialize_from_config(
+            config,
+            inference=(mode == "test"),
+            verbose=True,
+            dataset_phase=_ds_phase,
+        )
         dataset = result["dataset"]
         config = result["config"]
         engine = Engine(model=config.RUN, dataset=dataset, config=config)

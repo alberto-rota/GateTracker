@@ -115,9 +115,14 @@ def temporal_supervised_losses(
     loss_pos = (loss_h * mpos).sum() / (mpos.sum().clamp_min(eps))
 
     vt = vis_target.to(dtype=tracks_pred.dtype).clamp(0.0, 1.0)
-    loss_vis = F.binary_cross_entropy_with_logits(
-        visibility_pred, vt, reduction="mean",
+    # Class-imbalanced BCE: occluded frames are rarer; up-weight negatives so the
+    # head does not collapse to "always visible" under the position losses.
+    w_occ = float(config.get("TEMPORAL_SUP_VIS_OCC_WEIGHT", 1.0))
+    w_vis_el = 1.0 + (w_occ - 1.0) * (1.0 - vt)  # [B, Q, T]
+    bce = F.binary_cross_entropy_with_logits(
+        visibility_pred, vt, reduction="none",
     )
+    loss_vis = (bce * w_vis_el).mean()
 
     w_pos = float(config.get("TEMPORAL_SUP_POS_WEIGHT", 1.0))
     w_vis = float(config.get("TEMPORAL_SUP_VIS_WEIGHT", 1.0))
@@ -308,11 +313,9 @@ def compute_pairwise_tracking_losses(
         "loss_cycle": loss_cycle.item(),
         "loss_desc": loss_desc.item(),
         "loss_reg": loss_reg.item(),
-        "loss_total": loss_total.item(),
         "cycle_error": cycle_err,
         "coarse_to_fine_delta": coarse_fine_delta,
         "confidence_mean": scores_fwd.mean().item(),
-        "confidence_std": scores_fwd.std().item(),
     }
     if vis_fwd is not None:
         vis_prob = torch.sigmoid(vis_fwd.squeeze(-1))
@@ -412,6 +415,50 @@ def temporal_cycle_consistency_loss(
         err = err * wq
 
     return err.mean()
+
+
+def temporal_velocity_huber_loss(
+    tracks: torch.Tensor,
+    visibility: Optional[torch.Tensor] = None,
+    self_sup_mask_bqt: Optional[torch.Tensor] = None,
+    beta: float = 4.0,
+) -> torch.Tensor:
+    r"""First-order Huber on consecutive displacements (penalises single-frame spikes).
+
+    Complements ``temporal_smoothness_loss`` (second-order): a brief outlier jump
+    has small acceleration if it returns the next frame, but produces a large
+    velocity impulse here.
+
+    Args:
+        tracks:     [B, Q, T, 2] tracked positions.
+        visibility: [B, Q, T] visibility logits (optional).
+        self_sup_mask_bqt: Optional [B, Q, T] float mask.
+        beta:       Huber threshold in **pixels** (L2 step norm).
+
+    Returns:
+        Scalar loss.
+    """
+    T = tracks.shape[2]
+    if T < 2:
+        return torch.tensor(0.0, device=tracks.device, dtype=tracks.dtype)
+
+    step = (tracks[:, :, 1:, :] - tracks[:, :, :-1, :]).norm(dim=-1)  # [B, Q, T-1]
+    loss_h = F.smooth_l1_loss(
+        step, torch.zeros_like(step), beta=float(beta), reduction="none",
+    )
+
+    if visibility is not None:
+        vis_prob = torch.sigmoid(visibility)
+        w = torch.minimum(vis_prob[:, :, :-1], vis_prob[:, :, 1:]).detach()  # [B, Q, T-1]
+        loss_h = loss_h * w
+
+    if self_sup_mask_bqt is not None:
+        m0 = self_sup_mask_bqt[:, :, :-1]
+        m1 = self_sup_mask_bqt[:, :, 1:]
+        wm = torch.minimum(m0, m1).detach()
+        loss_h = loss_h * wm
+
+    return loss_h.mean()
 
 
 def temporal_smoothness_loss(
@@ -564,14 +611,18 @@ def feature_persistence_loss(
 
 def visibility_regularization_loss(
     visibility: torch.Tensor,
+    entropy_scale: float = 0.1,
 ) -> torch.Tensor:
     """Encourage temporally smooth and non-degenerate visibility predictions.
 
-    Combines temporal smoothness (penalize flickering) with entropy
-    regularization (avoid all-visible collapse).
+    Combines temporal smoothness (penalize flickering) with mild entropy
+    regularization (avoid all-visible collapse). ``entropy_scale`` defaults to
+    the historical 0.1; lower values (e.g. 0.02--0.05) sharpen occlusion logits
+    when supervised visibility is strong.
 
     Args:
-        visibility: [B, Q, T] visibility logits.
+        visibility:    [B, Q, T] visibility logits.
+        entropy_scale: Multiplier on the entropy term.
 
     Returns:
         Scalar loss.
@@ -595,7 +646,7 @@ def visibility_regularization_loss(
     # Maximize entropy → minimize negative entropy
     entropy_loss = -entropy.mean()
 
-    return smooth_loss + 0.1 * entropy_loss
+    return smooth_loss + float(entropy_scale) * entropy_loss
 
 
 def compute_temporal_tracking_losses(
@@ -629,36 +680,48 @@ def compute_temporal_tracking_losses(
         synth_self_sup_scale: Multiplier on cycle/smooth/desc/feat (not ``loss_vis`` reg).
 
     Returns:
-        dict with ``loss_total`` (differentiable scalar) and ``metrics`` sub-dict.
+        dict with ``loss_total`` (differentiable scalar) and ``metrics`` (detached
+        per-term scalars; the blended total is logged separately as ``Loss``).
     """
     w_cycle = float(config.get("TEMPORAL_CYCLE_LOSS_WEIGHT", 1.0)) * float(cycle_weight_scale)
     w_smooth = float(config.get("TEMPORAL_SMOOTHNESS_LOSS_WEIGHT", 0.3))
+    w_vel = float(config.get("TEMPORAL_VELOCITY_HUBER_WEIGHT", 0.0))
+    vel_beta = float(config.get("TEMPORAL_VELOCITY_HUBER_BETA", 4.0))
     w_desc = float(config.get("TEMPORAL_DESC_LOSS_WEIGHT", 0.5))
     w_feat = float(config.get("TEMPORAL_FEATURE_LOSS_WEIGHT", 0.5))
     w_vis = float(config.get("TEMPORAL_VIS_REG_WEIGHT", 0.1))
+    ent_scale = float(config.get("TEMPORAL_VIS_REG_ENTROPY_SCALE", 0.1))
     w_synth = float(synth_self_sup_scale)
 
     loss_cycle = temporal_cycle_consistency_loss(
         tracks, reverse_tracks, query_points, visibility, self_sup_mask_bqt,
     )
     loss_smooth = temporal_smoothness_loss(tracks, visibility, self_sup_mask_bqt)
+    loss_vel = temporal_velocity_huber_loss(
+        tracks, visibility, self_sup_mask_bqt, beta=vel_beta,
+    )
     loss_desc = temporal_descriptor_consistency_loss(
         tracks, query_points, descriptor_maps, patch_size, visibility, self_sup_mask_bqt,
     )
     loss_feat = feature_persistence_loss(
         tracks, query_points, fine_feature_maps, feature_stride, visibility, self_sup_mask_bqt,
     )
-    loss_vis = visibility_regularization_loss(visibility)
+    loss_vis = visibility_regularization_loss(visibility, entropy_scale=ent_scale)
 
-    loss_cycle = torch.nan_to_num(loss_cycle, nan=0.0)
-    loss_smooth = torch.nan_to_num(loss_smooth, nan=0.0)
-    loss_desc = torch.nan_to_num(loss_desc, nan=0.0)
-    loss_feat = torch.nan_to_num(loss_feat, nan=0.0)
-    loss_vis = torch.nan_to_num(loss_vis, nan=0.0)
+    # Replace NaN/Inf with 0 so a single degenerate batch cannot poison the
+    # parameter update; clipping downstream bounds the effective step anyway.
+    _sanitize = lambda t: torch.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0)
+    loss_cycle = _sanitize(loss_cycle)
+    loss_smooth = _sanitize(loss_smooth)
+    loss_vel = _sanitize(loss_vel)
+    loss_desc = _sanitize(loss_desc)
+    loss_feat = _sanitize(loss_feat)
+    loss_vis = _sanitize(loss_vis)
 
     loss_core = (
         w_cycle * loss_cycle
         + w_smooth * loss_smooth
+        + w_vel * loss_vel
         + w_desc * loss_desc
         + w_feat * loss_feat
     )
@@ -667,10 +730,10 @@ def compute_temporal_tracking_losses(
     metrics = {
         "loss_cycle": loss_cycle.item(),
         "loss_smooth": loss_smooth.item(),
+        "loss_vel": loss_vel.item(),
         "loss_desc": loss_desc.item(),
         "loss_feat": loss_feat.item(),
         "loss_vis": loss_vis.item(),
-        "loss_total": loss_total.item(),
     }
 
     return {

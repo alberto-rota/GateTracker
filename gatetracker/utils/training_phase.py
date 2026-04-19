@@ -83,6 +83,9 @@ def build_optimizer_param_groups(model: nn.Module, config: Any) -> List[Dict[str
     lr_fusion = float(_cfg_get(config, "LR_FUSION", lr_default))
     lr_fine = float(_cfg_get(config, "LR_FINE_FEATURE", lr_default))
     lr_track = float(_cfg_get(config, "LR_TRACKING_HEAD", lr_default))
+    # Gate sub-modules (``local_gates``, ``register_gates``) are tiny and
+    # benefit from a faster LR than the rest of the fusion; default 5x.
+    lr_gate = float(_cfg_get(config, "LR_GATE", lr_fusion * 5.0))
 
     model = unwrap_model(model)
 
@@ -99,13 +102,30 @@ def build_optimizer_param_groups(model: nn.Module, config: Any) -> List[Dict[str
 
     fusion = getattr(model, "hierarchical_fusion", None)
     if fusion is not None:
-        params = _take(fusion)
-        if params:
+        gate_params: List[nn.Parameter] = []
+        fusion_params: List[nn.Parameter] = []
+        for name, p in fusion.named_parameters():
+            if not p.requires_grad:
+                continue
+            assigned.add(id(p))
+            if name.startswith("local_gates") or name.startswith("register_gates"):
+                gate_params.append(p)
+            else:
+                fusion_params.append(p)
+        if fusion_params:
             groups.append(
                 {
-                    "params": params,
+                    "params": fusion_params,
                     "lr": lr_fusion,
                     "group_name": "hierarchical_fusion",
+                }
+            )
+        if gate_params:
+            groups.append(
+                {
+                    "params": gate_params,
+                    "lr": lr_gate,
+                    "group_name": "hierarchical_fusion_gate",
                 }
             )
 

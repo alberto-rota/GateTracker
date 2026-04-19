@@ -2135,19 +2135,30 @@ class Engine:
         from dataset.sequence_sampler import SequenceWindowDataset
 
         window_size = int(self.config.get("TRACKING_SEQUENCE_LENGTH", 8))
+        default_ws_stride = max(1, window_size // 2)
+        train_ws = self.config.get("TRACKING_WINDOW_TRAIN_STRIDE")
+        train_ws_stride = (
+            max(1, int(train_ws)) if train_ws is not None else default_ws_stride
+        )
         self._tracking_datasets = {}
         for phase_name in ("Training", "Validation"):
             base_ds = self.dataset[phase_name]
             try:
+                stride = (
+                    train_ws_stride
+                    if phase_name == "Training"
+                    else default_ws_stride
+                )
                 seq_ds = SequenceWindowDataset(
                     base_ds,
                     window_size=window_size,
-                    stride=max(1, window_size // 2),
+                    stride=stride,
                     mode="train" if phase_name == "Training" else "eval",
                 )
                 self._tracking_datasets[phase_name] = seq_ds
                 self.logger.info(
-                    f"Built {phase_name} sequence dataset: {len(seq_ds)} windows of {window_size} frames",
+                    f"Built {phase_name} sequence dataset: {len(seq_ds)} windows of "
+                    f"{window_size} frames (start stride={stride})",
                     context="TRACKING",
                 )
             except ValueError as e:

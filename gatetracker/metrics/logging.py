@@ -69,6 +69,8 @@ def register_wandb_step_axes(wb: Any) -> None:
         wb.define_metric(f"{phase}/images/*", step_metric=sm)
         for sub in arch_sub:
             wb.define_metric(f"{phase}/{sub}/*", step_metric=sm)
+        wb.define_metric(f"{phase}/tracking/self_sup/*", step_metric=sm)
+        wb.define_metric(f"{phase}/tracking/pseudo_gt/*", step_metric=sm)
 
     # Legacy / watch: gradient + LR keys not under Phase/Category
     wb.define_metric("Gradients/*", step_metric="step/train_batch")
@@ -85,8 +87,9 @@ def register_wandb_step_axes(wb: Any) -> None:
     # ``Test/tracking/<seq>/delta_avg`` still receive ``step/test_eval`` in the
     # same ``log`` dict but may chart on the default step until flattened.
     wb.define_metric("Test/tracking/*", step_metric="step/test_eval")
+    wb.define_metric("Test/tracking/eval/*", step_metric="step/test_eval")
     wb.define_metric("Test/Summary", step_metric="step/test_eval")
-    wb.define_metric("Validation/stereomis_gt/*", step_metric="step/epoch")
+    wb.define_metric("Validation/tracking/eval/*", step_metric="step/epoch")
 
 
 METRIC_CATEGORIES = {
@@ -99,11 +102,8 @@ METRIC_CATEGORIES = {
     "F1": "matching",
     "InlierRatio": "matching",
     "NCM": "matching",
-    "Precision": "matching",
-    "Recall": "matching",
     "AUCPR": "matching",
     "EpipolarError": "matching",
-    "FundamentalError": "matching",
     "MDistMean": "matching",
     "MatchCount": "matching",
 

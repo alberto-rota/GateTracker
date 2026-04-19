@@ -89,6 +89,12 @@ from utilities import get_hostname, detect_aval_cpus, coloredbar
 
 from .multi_dataset import MultiDataset
 from .specialized import SCARED, CHOLEC80, GRASP, STEREOMIS
+from .loader_phase import (
+    infer_dataset_phase,
+    dataset_active_for_phase,
+    merge_phase_video_list,
+    cap_video_list,
+)
 from .utils import split_videos, select_videos_by_patterns
 
 try:
@@ -172,7 +178,7 @@ def collate_fn(batch):
     return result
 
 
-def initialize_from_config(config, inference=False, verbose=False):
+def initialize_from_config(config, inference=False, verbose=False, dataset_phase=None):
     """
     # Initialize Datasets from Configuration
 
@@ -190,6 +196,10 @@ def initialize_from_config(config, inference=False, verbose=False):
       all augmentation probabilities are set to 0.0. Default: False.
     - **verbose** (`bool`): Whether to print verbose output including dataset
       statistics and initialization progress. Default: False.
+    - **dataset_phase** (`str`, optional): ``\"pretrain\"`` or ``\"tracking\"``.
+      When ``None``, inferred from ``config.PHASE`` (``pretrain``/``end2end`` →
+      pretrain; ``tracking`` → tracking). Used with per-dataset ``PHASES`` and
+      ``PRETRAIN`` / ``TRACKING`` video-list overrides.
 
     ## Configuration Structure
 
@@ -314,6 +324,8 @@ def initialize_from_config(config, inference=False, verbose=False):
     if not datasets_config:
         raise ValueError("No datasets specified in configuration")
 
+    active_phase = infer_dataset_phase(config, dataset_phase)
+
     # Initialize empty lists for training and validation datasets
     training_datasets = []
     validation_datasets = []
@@ -324,6 +336,20 @@ def initialize_from_config(config, inference=False, verbose=False):
     # First pass: determine video splits for all datasets (without creating them)
     dataset_configs_processed = []
     for dataset_name, dataset_config in datasets_config.items():
+        if not dataset_active_for_phase(dataset_name, dataset_config, active_phase):
+            logger.info(
+                f"[DATASET] Skipping {dataset_name} for phase={active_phase} (PHASES filter)."
+            )
+            continue
+
+        dataset_class = globals().get(dataset_name)
+        if dataset_class is None:
+            logger.info(
+                f"[DATASET] Skipping {dataset_name}: no Mono3D loader class "
+                f"(eval-only datasets use engine hooks, not MultiDataset)."
+            )
+            continue
+
         all_dataset_names.append(dataset_name)
 
         # Get dataset path from config (DATASET_DIR / DATASET_ROOTDIR via env_bootstrap)
@@ -345,17 +371,18 @@ def initialize_from_config(config, inference=False, verbose=False):
             else:
                 dataset_path = config_path
 
-        # Get dataset videos
-        dataset_class = globals().get(dataset_name)
-        if dataset_class is None:
-            raise ValueError(f"No dataset class found for dataset {dataset_name}")
-
         all_videos = dataset_class.videonames()
 
         # Check if explicit video lists are provided (new method)
-        train_videos_config = dataset_config.get("TRAIN_VIDEOS", None)
-        val_videos_config = dataset_config.get("VAL_VIDEOS", None)
-        test_videos_config = dataset_config.get("TEST_VIDEOS", None)
+        train_videos_config = merge_phase_video_list(
+            dataset_config, active_phase, "TRAIN_VIDEOS",
+        )
+        val_videos_config = merge_phase_video_list(
+            dataset_config, active_phase, "VAL_VIDEOS",
+        )
+        test_videos_config = merge_phase_video_list(
+            dataset_config, active_phase, "TEST_VIDEOS",
+        )
         
         # Use explicit method if TRAIN_VIDEOS or VAL_VIDEOS are set
         # (If only TEST_VIDEOS is set, use old method for backward compatibility)
@@ -387,6 +414,10 @@ def initialize_from_config(config, inference=False, verbose=False):
             training_videos, validation_videos = split_videos(
                 all_videos, train_val_split, test_videos
             )
+
+        training_videos = cap_video_list(training_videos, "MAX_TRAIN_VIDEOS", dataset_config)
+        validation_videos = cap_video_list(validation_videos, "MAX_VAL_VIDEOS", dataset_config)
+        test_videos = cap_video_list(test_videos, "MAX_TEST_VIDEOS", dataset_config)
         
         # Store processed config for later dataset creation
         dataset_configs_processed.append({
@@ -416,6 +447,12 @@ def initialize_from_config(config, inference=False, verbose=False):
         and len(random_pose_ranges_override) == 2
     )
     
+    if not dataset_configs_processed:
+        raise ValueError(
+            f"No Mono3D datasets active for phase={active_phase}. "
+            "Add at least one dataset with PHASES including this phase."
+        )
+
     # Second pass: Create all training datasets (grouped logging)
     for ds_info in dataset_configs_processed:
         training_ds = ds_info["class"](

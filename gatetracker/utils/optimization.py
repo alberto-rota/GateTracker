@@ -262,24 +262,64 @@ class Adagrad(torch.optim.Adagrad):
 
 def get_norms(params) -> Tuple[float, float]:
     """
-    Calculate L1 and L2 norms of model parameters.
+    DEPRECATED: returns (L1_of_params, L2_of_params).
 
-    This function computes the L1 (Manhattan) and L2 (Euclidean) norms of the
-    provided parameters, which are useful for regularization and model analysis.
-
-    Args:
-        params: Iterable or generator of PyTorch parameter tensors to compute norms for
-
-    Returns:
-        Tuple containing:
-            - L1 norm (float): Sum of absolute values
-            - L2 norm (float): Square root of sum of squared values
+    Kept for backward compatibility with callers that inspect parameter magnitudes.
+    For training diagnostics use ``get_grad_and_weight_norms`` instead: this
+    function does NOT look at ``.grad`` and will not yield the pre-clip
+    gradient norm.
     """
-    params_list = list(params)
-    l1_total = sum(p.detach().abs().sum().item() for p in params_list if p is not None)
-    l2_total = sum((p.detach() ** 2).sum().item() for p in params_list if p is not None)
+    params_list = [p for p in params if p is not None]
+    l1_total = sum(p.detach().abs().sum().item() for p in params_list)
+    l2_total = sum((p.detach() ** 2).sum().item() for p in params_list)
     l2_norm = l2_total ** 0.5
     return l1_total, l2_norm
+
+
+def get_grad_and_weight_norms(
+    params,
+    norm_type: float = 2.0,
+) -> Tuple[float, float]:
+    """
+    Compute the gradient and weight L_p norms (default L2) over an iterable
+    of parameters, restricted to parameters with ``requires_grad=True``.
+
+    Matches the quantity computed by ``torch.nn.utils.clip_grad_norm_``:
+
+    .. math::
+
+        \\lVert g \\rVert_p = \\Big( \\sum_i \\lVert g_i \\rVert_p^p \\Big)^{1/p}
+
+    Args:
+        params: Iterable of ``torch.nn.Parameter`` (generator or list).
+        norm_type: Order of the norm (default 2.0 → Euclidean).
+
+    Returns:
+        Tuple of ``(grad_norm, weight_norm)`` as Python floats. If no
+        trainable params are present, both are 0.0. If some params have no
+        ``.grad`` populated they are simply skipped in ``grad_norm``.
+    """
+    trainable = [p for p in params if p is not None and p.requires_grad]
+    if not trainable:
+        return 0.0, 0.0
+
+    grads = [p.grad.detach() for p in trainable if p.grad is not None]
+    if len(grads) == 0:
+        grad_norm = 0.0
+    else:
+        device = grads[0].device
+        # [num_tensors] — per-tensor norms, then aggregated
+        per_tensor = torch.stack(
+            [torch.norm(g, p=norm_type).to(device) for g in grads]
+        )  # [num_tensors]
+        grad_norm = torch.norm(per_tensor, p=norm_type).item()
+
+    per_param = torch.stack(
+        [torch.norm(p.detach(), p=norm_type) for p in trainable]
+    )  # [num_trainable]
+    weight_norm = torch.norm(per_param, p=norm_type).item()
+
+    return grad_norm, weight_norm
 
 
 class EarlyStopping:

@@ -20,14 +20,26 @@ so the cost of long inference is linear in T_total rather than ~2× redundant.
 """
 
 from typing import Optional
+import warnings
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
+from gatetracker.distributed_context import unwrap_model
 from gatetracker.matching import correspondence
 from gatetracker.matching.matcher import Matcher
 from gatetracker.tracking.temporal_refinement import TemporalRefinementNetwork
 from gatetracker.utils.tensor_ops import embedding2chw, chw2embedding
+
+# ``torch.utils.checkpoint`` wraps recomputation in ``torch.cpu.amp.autocast``,
+# which is deprecated. That path runs during **backward**, so a local
+# ``catch_warnings`` around ``checkpoint()`` does not cover it — register once.
+warnings.filterwarnings(
+    "ignore",
+    category=FutureWarning,
+    message=r".*torch\.cpu\.amp\.autocast.*",
+)
 
 
 class TemporalTracker(nn.Module):
@@ -139,17 +151,17 @@ class TemporalTracker(nn.Module):
 
         desc_chunks = []
         fine_chunks = []
+        # DDP does not expose private methods like `_encode_image` on the wrapper.
+        backbone = unwrap_model(self.matcher.model)
 
         with torch.no_grad():
             for start in range(0, N_total, chunk_size):
                 chunk = flat_frames[start : start + chunk_size]  # [C_bs, 3, H, W]
-                _, matched_tokens, _, _, fine_map, _ = (
-                    self.matcher.model._encode_image(chunk)
-                )
+                _, matched_tokens, _, _, fine_map, _ = backbone._encode_image(chunk)
                 emb = matched_tokens.permute(0, 2, 1)  # [C_bs, C, N]
-                if self.matcher.model.resampled_patch_size != 16:
+                if backbone.resampled_patch_size != 16:
                     emb = embedding2chw(emb, embed_dim_last=False)
-                    emb = self.matcher.model.patchsize_resampler(emb)
+                    emb = backbone.patchsize_resampler(emb)
                     emb = chw2embedding(emb)
                 desc_chunks.append(embedding2chw(emb, embed_dim_last=False))
                 fine_chunks.append(fine_map)
@@ -269,7 +281,9 @@ class TemporalTracker(nn.Module):
                 "coarse_tracks": coarse_tracks,
             }
 
-        feature_stride = getattr(self.matcher.model, "fine_feature_stride", 4)
+        feature_stride = getattr(
+            unwrap_model(self.matcher.model), "fine_feature_stride", 4,
+        )
         if query_features is None:
             query_features = correspondence.sample_embeddings_at_points(
                 fine_feature_maps[:, 0], query_points, feature_stride,
@@ -299,6 +313,8 @@ class TemporalTracker(nn.Module):
         window_size: int = 16,
         stride: Optional[int] = None,
         encoder_chunk_size: Optional[int] = None,
+        vis_agg: str = "mean",
+        infer_max_step_px: float = 0.0,
     ) -> dict:
         """Track points across a long sequence using sliding overlapping windows.
 
@@ -326,6 +342,10 @@ class TemporalTracker(nn.Module):
             stride:              Window step. Defaults to ``window_size // 2``.
             encoder_chunk_size:  Override for the per-call backbone chunk
                 size. Defaults to ``self.encoder_chunk_size``.
+            vis_agg:             ``mean`` (weighted average) or ``min`` (pessimistic
+                fusion across overlapping windows) for visibility probability.
+            infer_max_step_px:   If > 0, clamp each frame-to-frame displacement
+                to this many pixels after fusion (0 = disabled).
 
         Returns:
             dict with tracks [B, Q, T_total, 2] and visibility [B, Q, T_total]
@@ -343,7 +363,9 @@ class TemporalTracker(nn.Module):
         )
 
         patch_size = self.matcher.patch_size
-        feature_stride = getattr(self.matcher.model, "fine_feature_stride", 4)
+        feature_stride = getattr(
+            unwrap_model(self.matcher.model), "fine_feature_stride", 4,
+        )
 
         query_desc_anchor = correspondence.sample_embeddings_at_points(
             descriptor_maps_all[0], query_points, patch_size,
@@ -358,10 +380,14 @@ class TemporalTracker(nn.Module):
         all_tracks = torch.zeros(B, Q, T_total, 2, device=device)
         all_vis_prob = torch.zeros(B, Q, T_total, device=device)
         weight_map = torch.zeros(B, Q, T_total, device=device)
+        vis_mode = str(vis_agg).lower().strip()
+        use_vis_min = vis_mode in ("min", "pessimistic")
 
         all_tracks[:, :, 0, :] = query_points
         all_vis_prob[:, :, 0] = 1.0
         weight_map[:, :, 0] = 1.0
+        if use_vis_min:
+            all_vis_prob[:, :, 1:] = 1.0
 
         for w_start in range(0, T_total - 1, stride):
             w_end = min(w_start + window_size, T_total)
@@ -400,10 +426,15 @@ class TemporalTracker(nn.Module):
                 all_tracks[:, :, global_idx, :] * cur_w.unsqueeze(-1)
                 + window_tracks * new_w.unsqueeze(-1)
             ) / denom.unsqueeze(-1)
-            all_vis_prob[:, :, global_idx] = (
-                all_vis_prob[:, :, global_idx] * cur_w
-                + window_prob * new_w
-            ) / denom
+            if use_vis_min:
+                all_vis_prob[:, :, global_idx] = torch.minimum(
+                    all_vis_prob[:, :, global_idx], window_prob,
+                )
+            else:
+                all_vis_prob[:, :, global_idx] = (
+                    all_vis_prob[:, :, global_idx] * cur_w
+                    + window_prob * new_w
+                ) / denom
             weight_map[:, :, global_idx] = cur_w + new_w
 
         # Anchor the global frame 0 exactly at the user-provided query
@@ -411,6 +442,13 @@ class TemporalTracker(nn.Module):
         # anchor by sub-pixel amounts and that is visually distracting in the
         # rendered tracks video.
         all_tracks[:, :, 0, :] = query_points
+
+        max_step = float(infer_max_step_px)
+        if max_step > 0.0 and T_total > 1:
+            d = all_tracks[:, :, 1:, :] - all_tracks[:, :, :-1, :]  # [B, Q, T-1, 2]
+            n = d.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+            scale = (max_step / n).clamp(max=1.0)
+            all_tracks[:, :, 1:, :] = all_tracks[:, :, :-1, :] + d * scale
 
         # Convert aggregated probabilities back to logits for downstream
         # consumers that expect ``visibility`` in logit space.
@@ -451,13 +489,19 @@ class TemporalTracker(nn.Module):
             epoch: Current epoch (for curriculum on supervised weight).
 
         Returns:
-            dict with ``loss_total`` (differentiable) and ``metrics`` sub-dict.
+            dict with:
+
+            - ``loss_total``: scalar tensor optimized (self-sup ± pseudo-GT blend).
+            - ``metrics_self_sup``: detached self-supervised term scalars plus
+              ``loss_self_sup_total`` (pre-blend self-sup objective).
+            - ``metrics_pseudo_gt``: pseudo-GT supervised scalars (zeros when inactive),
+              including ``pseudo_gt_active`` and ``pseudo_lambda``.
         """
         from gatetracker.data.pseudo_gt import (
-            DeformationConfig,
             GridConfig,
             PseudoGTGenerator,
-            TrajectoryConfig,
+            deformation_config_from_run_config,
+            trajectory_config_from_run_config,
         )
         from gatetracker.tracking.losses import (
             _sample_query_grid,
@@ -502,6 +546,8 @@ class TemporalTracker(nn.Module):
                 margin_frac=float(config.get("PSEUDO_GT_GRID_MARGIN_FRAC", 0.03)),
             )
             erode = int(config.get("PSEUDO_GT_MASK_ERODE_PX", 0))
+            traj_cfg = trajectory_config_from_run_config(config, n_frames=T)
+            deform_cfg = deformation_config_from_run_config(config)
 
             with torch.no_grad():
                 depth, _, K = geometry_pipeline.compute_geometry(
@@ -521,8 +567,8 @@ class TemporalTracker(nn.Module):
                     image=frames[b : b + 1, 0],
                     depth=depth[b : b + 1],
                     intrinsics=K[b : b + 1],
-                    trajectory=TrajectoryConfig(n_frames=T),
-                    deformation=DeformationConfig(),
+                    trajectory=traj_cfg,
+                    deformation=deform_cfg,
                     grid=grid_cfg,
                     seed=seed_u,
                     frame_valid_erode_px=erode,
@@ -576,7 +622,9 @@ class TemporalTracker(nn.Module):
                 "Enable REFINEMENT_METHOD=feature_softargmax in config."
             )
 
-        feature_stride = getattr(self.matcher.model, "fine_feature_stride", 4)
+        feature_stride = getattr(
+            unwrap_model(self.matcher.model), "fine_feature_stride", 4,
+        )
 
         # --- Forward tracking ---
         coarse_tracks = self._global_coarse_match(query_points, descriptor_maps)
@@ -600,10 +648,26 @@ class TemporalTracker(nn.Module):
             rev_query_fine = correspondence.sample_embeddings_at_points(
                 fine_rev[:, 0], rev_query, feature_stride,
             )
-            bwd_out = self.refinement_net(
-                coarse_rev, rev_query_fine, fine_rev, feature_stride,
+            # Second full refinement forward stacks autograd state on top of the
+            # first; checkpoint trades extra compute for much lower peak VRAM.
+            ref_mod = unwrap_model(self.refinement_net)
+            fs = int(feature_stride)
+
+            def _cycle_refine_tracks(
+                co: torch.Tensor,
+                qf: torch.Tensor,
+                fm: torch.Tensor,
+            ) -> torch.Tensor:
+                return ref_mod(co, qf, fm, fs)["tracks"]  # [B, Q, T, 2]
+
+            tracks_bwd_tensor = checkpoint(
+                _cycle_refine_tracks,
+                coarse_rev,
+                rev_query_fine,
+                fine_rev,
+                use_reentrant=False,
             )
-            tracks_bwd = bwd_out["tracks"].flip(dims=[2])  # [B, Q, T, 2]
+            tracks_bwd = tracks_bwd_tensor.flip(dims=[2])  # [B, Q, T, 2]
         else:
             tracks_bwd = tracks_fwd.detach()
 
@@ -624,7 +688,19 @@ class TemporalTracker(nn.Module):
             synth_self_sup_scale=synth_self_sup_scale,
         )
 
-        loss_total = loss_dict["loss_total"]
+        loss_self_sup_tensor = loss_dict["loss_total"]
+        metrics_self_sup: dict = dict(loss_dict.pop("metrics"))
+        metrics_self_sup["loss_self_sup_total"] = float(loss_self_sup_tensor.detach().item())
+
+        metrics_pseudo_gt: dict = {
+            "pseudo_gt_active": 0.0,
+            "pseudo_lambda": 0.0,
+            "loss_sup_pos": 0.0,
+            "loss_sup_vis": 0.0,
+            "loss_sup_total": 0.0,
+            "sup_mask_fraction": 0.0,
+        }
+        loss_total = loss_self_sup_tensor
 
         if use_pseudo and tracks_gt is not None and vis_target is not None and composite_m is not None:
             sup = temporal_supervised_losses(
@@ -637,15 +713,13 @@ class TemporalTracker(nn.Module):
             )
             cur_epochs = max(1, int(config.get("PSEUDO_GT_CURRICULUM_EPOCHS", 10)))
             lam = lam_max * min(1.0, float(epoch + 1) / float(cur_epochs))
-            loss_total = (1.0 - lam) * loss_total + lam * sup["loss_sup_total"]
-            loss_dict["metrics"].update(sup["metrics"])
-            loss_dict["metrics"]["pseudo_lambda"] = lam
-            loss_dict["metrics"]["pseudo_gt_active"] = 1.0
-        else:
-            loss_dict["metrics"]["pseudo_gt_active"] = 0.0
-            loss_dict["metrics"]["pseudo_lambda"] = 0.0
+            loss_total = (1.0 - lam) * loss_self_sup_tensor + lam * sup["loss_sup_total"]
+            metrics_pseudo_gt.update(sup["metrics"])
+            metrics_pseudo_gt["pseudo_lambda"] = float(lam)
+            metrics_pseudo_gt["pseudo_gt_active"] = 1.0
 
         loss_dict["loss_total"] = loss_total
-        loss_dict["metrics"]["loss_total"] = float(loss_total.detach().item())
+        loss_dict["metrics_self_sup"] = metrics_self_sup
+        loss_dict["metrics_pseudo_gt"] = metrics_pseudo_gt
 
         return loss_dict

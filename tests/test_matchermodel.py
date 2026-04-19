@@ -205,9 +205,7 @@ def test_refinement_metrics_report_pre_post_gain():
     assert metrics["CoarseErrorMean"] == pytest.approx(1.5)
     assert metrics["RefinedErrorMean"] == pytest.approx(0.5)
     assert metrics["RefinementGainPx"] == pytest.approx(1.0)
-    assert metrics["RefinementGainRatio"] == pytest.approx(2.0 / 3.0)
     assert metrics["RefinementWinRate"] == pytest.approx(1.0)
-    assert metrics["RefinementGainConfidenceCorr"] is None
 
 
 def test_infonce_respects_confidence_weights():

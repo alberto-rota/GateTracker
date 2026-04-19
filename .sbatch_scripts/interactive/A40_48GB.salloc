@@ -1,6 +1,7 @@
 # Interactive allocation for A40 GPU
 # This file contains the salloc command for interactive sessions
+# After the node is allocated, export thread caps before torchrun, e.g.:
+#   export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
 
 salloc --gres=gpu:a40:1 --partition=a40  --cpus-per-task=4 --time=4:00:00 --job-name=U_it_A40 --mail-user=alberto1.rota@polimi.it --mail-type=ALL
-
 

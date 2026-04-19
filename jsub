@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# Submit Slurm jobs from this repository's .sbatch_scripts/ (UnReflectAnything-style).
+set -euo pipefail
+
+_repo_root() {
+  cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd
+}
+
+REPO_ROOT="$(_repo_root)"
+SBATCH_ROOT="${GT_SBATCH_SCRIPTS:-$REPO_ROOT/.sbatch_scripts}"
+
+usage() {
+  cat <<'EOF'
+GateTracker jsub — submit .sbatch files under .sbatch_scripts/
+
+Usage:
+  jsub [--dry-run] <path/to/job.sbatch>
+        Path is relative to .sbatch_scripts/ (see --list).
+
+  jsub [sbatch_options...] <path/to/job.sbatch>
+        Options before the job path are passed to sbatch(1), e.g.
+        jsub -J myjob -p a100 pretrain/distributed/A100_80GB.sbatch
+
+  jsub --list | -l
+        List all *.sbatch files under .sbatch_scripts/
+
+  jsub -w 'COMMAND ...' <path/to/agent.sbatch>
+        Replace __JSUB_WANDB_AGENT_PLACEHOLDER__ with COMMAND (for W&B agent jobs).
+
+Environment:
+  GT_SBATCH_SCRIPTS   Use this directory instead of <repo>/.sbatch_scripts/
+
+Examples:
+  jsub --list
+  jsub pretrain/distributed/A100_80GB.sbatch
+  jsub --dry-run tracking/singlegpu/A40_48GB.sbatch
+  jsub -w 'wandb agent entity/project/sweep_id' agent_gpu/singlegpu/A100_80GB.sbatch
+EOF
+  exit "${1:-0}"
+}
+
+list_jobs() {
+  if [[ ! -d "$SBATCH_ROOT" ]]; then
+    echo "jsub: directory not found: $SBATCH_ROOT" >&2
+    exit 2
+  fi
+  find "$SBATCH_ROOT" -type f \( -name '*.sbatch' -o -name '*.SBATCH' \) \
+    | sed "s|^$SBATCH_ROOT/||" | sort
+}
+
+LIST=0
+DRY_RUN=0
+WAND_REPLACE=""
+
+while (($#)); do
+  case "$1" in
+    -h | --help) usage 0 ;;
+    -l | --list) LIST=1; shift ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    -w)
+      if (($# < 2)); then
+        echo "jsub: -w requires a command string" >&2
+        exit 2
+      fi
+      WAND_REPLACE=$2
+      shift 2
+      ;;
+    --) shift; break ;;
+    -*)
+      break
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+if ((LIST)); then
+  list_jobs
+  exit 0
+fi
+
+if (($# == 0)); then
+  usage 2
+fi
+
+REL_JOB="${!#}"
+if [[ "$REL_JOB" != *.sbatch && "$REL_JOB" != *.SBATCH ]]; then
+  echo "jsub: last argument must be a .sbatch file (got: $REL_JOB)" >&2
+  exit 2
+fi
+
+FULL="$SBATCH_ROOT/$REL_JOB"
+if [[ ! -f "$FULL" ]]; then
+  echo "jsub: not found: $FULL" >&2
+  echo "Hint: jsub --list" >&2
+  exit 2
+fi
+
+SBATCH_FRONT=( "${@:1:$#-1}" )
+
+run_sbatch() {
+  local jobfile=$1
+  if ((DRY_RUN)); then
+    printf 'sbatch'
+    printf ' %q' "${SBATCH_FRONT[@]}" "$jobfile"
+    printf '\n'
+  else
+    sbatch "${SBATCH_FRONT[@]}" "$jobfile"
+  fi
+}
+
+if [[ -n "${WAND_REPLACE}" ]]; then
+  tmp=$(mktemp "${TMPDIR:-/tmp}/gt_jsub_XXXXXX.sbatch")
+  trap 'rm -f "$tmp"' EXIT
+  JSUB_W_CMD="$WAND_REPLACE" python3 - "$FULL" "$tmp" <<'PY'
+import os
+import sys
+
+src, dst = sys.argv[1], sys.argv[2]
+cmd = os.environ.get("JSUB_W_CMD", "")
+text = open(src, encoding="utf-8").read()
+if "__JSUB_WANDB_AGENT_PLACEHOLDER__" not in text:
+    sys.stderr.write(
+        "jsub: template has no __JSUB_WANDB_AGENT_PLACEHOLDER__ line; nothing to replace.\n"
+    )
+    sys.exit(2)
+open(dst, "w", encoding="utf-8").write(
+    text.replace("__JSUB_WANDB_AGENT_PLACEHOLDER__", cmd)
+)
+PY
+  run_sbatch "$tmp"
+else
+  run_sbatch "$FULL"
+fi

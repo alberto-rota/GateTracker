@@ -24,14 +24,17 @@ class RegisterGatedHierarchicalFusion(nn.Module):
         hidden_dim,
         layer_indices,
         num_register_tokens=4,
-        gate_temperature=2.0,
-        uniform_mixing=0.1,
+        gate_temperature=1.0,
+        uniform_mixing=0.0,
         layer_dropout_p=0.1,
-        gate_logit_bound=1.5,
+        gate_logit_bound=8.0,
     ):
         super().__init__()
         self.layer_indices = list(layer_indices)
         self.num_register_tokens = num_register_tokens
+        # ``gate_temperature`` kept as the initial / nominal value; the live
+        # temperature used at softmax time is ``current_gate_temperature`` so
+        # it can be annealed by the trainer via ``set_gate_temperature``.
         self.gate_temperature = gate_temperature
         self.uniform_mixing = uniform_mixing
         self.layer_dropout_p = layer_dropout_p
@@ -76,6 +79,20 @@ class RegisterGatedHierarchicalFusion(nn.Module):
             torch.tensor(self.layer_indices, dtype=torch.float32),
             persistent=False,
         )
+        self.register_buffer(
+            "current_gate_temperature",
+            torch.tensor(float(gate_temperature)),
+            persistent=False,
+        )
+
+    def set_gate_temperature(self, value: float) -> None:
+        """Update the softmax temperature used at inference / training time.
+
+        The trainer uses this hook to anneal the temperature from a smooth
+        (high T) regime early in training to a sharp (low T) regime as the
+        gate specializes.
+        """
+        self.current_gate_temperature.fill_(float(value))
 
     def forward(self, hidden_states, return_diagnostics=False):
         projected_layers = []
@@ -115,8 +132,9 @@ class RegisterGatedHierarchicalFusion(nn.Module):
             if not keep_mask.any():
                 keep_mask[torch.randint(len(self.layer_indices), (1,))] = True
             stacked_logits = stacked_logits.masked_fill(~keep_mask, -1e4)
+        temperature = torch.clamp(self.current_gate_temperature, min=1e-6)
         layer_weights = torch.softmax(
-            stacked_logits / max(self.gate_temperature, 1e-6), dim=0
+            stacked_logits / temperature, dim=0
         )  # [L, B, N, 1]
         if self.uniform_mixing > 0.0:
             layer_weights = (

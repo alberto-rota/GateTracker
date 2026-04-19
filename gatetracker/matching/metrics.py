@@ -274,9 +274,7 @@ def refinement_metrics(
         "CoarseErrorMean": None,
         "RefinedErrorMean": None,
         "RefinementGainPx": None,
-        "RefinementGainRatio": None,
         "RefinementWinRate": None,
-        "RefinementGainConfidenceCorr": None,
     }
     if (
         refined_scores is None
@@ -305,9 +303,7 @@ def refinement_metrics(
         "CoarseErrorMean": None,
         "RefinedErrorMean": None,
         "RefinementGainPx": None,
-        "RefinementGainRatio": None,
         "RefinementWinRate": None,
-        "RefinementGainConfidenceCorr": None,
     }
     if true_pixels_matched is None or true_pixels_matched.numel() == 0:
         return metrics_dict
@@ -331,23 +327,9 @@ def refinement_metrics(
             "CoarseErrorMean": coarse_error_mean.item(),
             "RefinedErrorMean": refined_error_mean.item(),
             "RefinementGainPx": gain_px_mean.item(),
-            "RefinementGainRatio": (
-                gain_px_mean / coarse_error_mean.clamp_min(1e-6)
-            ).item(),
             "RefinementWinRate": (gain_px > 0).float().mean().item(),
         }
     )
-
-    if refined_scores.numel() > 1:
-        score_std = refined_scores.std(unbiased=False)
-        gain_std = gain_px.std(unbiased=False)
-        if score_std > 1e-6 and gain_std > 1e-6:
-            centered_scores = refined_scores - refined_scores.mean()
-            centered_gain = gain_px - gain_px.mean()
-            metrics_dict["RefinementGainConfidenceCorr"] = (
-                (centered_scores * centered_gain).mean()
-                / (score_std * gain_std + 1e-8)
-            ).item()
 
     return metrics_dict
 
@@ -361,6 +343,7 @@ def precision_recall(
     threshold,
     fundamental=None,
     reduction="mean",
+    include_curve_means: bool = True,
 ):
     """
     Computes Precision, Recall, and AUC-PR for matched points across batches.
@@ -375,11 +358,16 @@ def precision_recall(
         fundamental (torch.Tensor, optional): Batch of fundamental matrices (shape: Bx3x3).
                                                       Required if true_pixels_matched is None.
         reduction (str): Reduction method ('mean' or 'none')
+        include_curve_means: If True (default), return mean precision/recall curve
+            values with AUCPR. If False, return ``(None, None, auc_pr)`` to avoid
+            redundant scalars when only AUCPR is logged.
 
     Returns:
         If reduction='mean':
-            precision (float): Mean Precision across all batches.
-            recall (float): Mean Recall across all batches.
+            precision (float | None): Mean precision curve mean, or None if
+                ``include_curve_means`` is False.
+            recall (float | None): Mean recall curve mean, or None if
+                ``include_curve_means`` is False.
             auc_pr (float): Area Under the Precision-Recall Curve.
         If reduction='none':
             precision (torch.Tensor): Precision for each batch.
@@ -418,10 +406,11 @@ def precision_recall(
 
         auc_pr = torch.trapz(precision_curve, recall_curve)
 
-        mean_precision = precision_curve.mean()
-        mean_recall = recall_curve.mean()
-
-        return mean_precision.item(), mean_recall.item(), auc_pr.item()
+        if include_curve_means:
+            mean_precision = precision_curve.mean()
+            mean_recall = recall_curve.mean()
+            return mean_precision.item(), mean_recall.item(), auc_pr.item()
+        return None, None, auc_pr.item()
     else:
         unique_batches = torch.unique(batch_indexes)
         precisions = []
@@ -571,7 +560,7 @@ def compute_metrics(
 
     fundamental_for_epipolar = fundamental_gt if has_valid_fundamental_gt else fundamental_pred
 
-    precision_val, recall_val, AUCPR = precision_recall(
+    _, _, AUCPR = precision_recall(
         source_pixels_matched.detach(),
         target_pixels_matched.detach(),
         true_pixels_matched.detach() if true_pixels_matched is not None else None,
@@ -579,6 +568,7 @@ def compute_metrics(
         scores.detach(),
         mp.config.MAX_EPIPOLAR_DISTANCE,
         fundamental_for_epipolar,
+        include_curve_means=False,
     )
 
     epipolar = epipolar_error(
@@ -587,11 +577,6 @@ def compute_metrics(
         fundamental_pred.cpu(),
         batch_idx_match.cpu(),
     )
-
-    if has_valid_fundamental_gt:
-        fundamental = fundamental_error(fundamental_pred.cpu(), fundamental_gt.cpu())[0]
-    else:
-        fundamental = None
 
     if true_pixels_matched is not None:
         mean_match_distance = mean_matching_distance(
@@ -608,11 +593,8 @@ def compute_metrics(
     )
 
     return {
-        "Precision": precision_val,
-        "Recall": recall_val,
         "AUCPR": AUCPR,
         "EpipolarError": epipolar,
-        "FundamentalError": fundamental,
         "MDistMean": mean_match_distance,
         **refine_metrics,
     }

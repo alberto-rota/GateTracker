@@ -25,8 +25,8 @@ Usage::
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from dataclasses import dataclass, replace
+from typing import Any, List, Mapping, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -43,6 +43,8 @@ __all__ = [
     "GridConfig",
     "PseudoGTResult",
     "PseudoGTGenerator",
+    "trajectory_config_from_run_config",
+    "deformation_config_from_run_config",
 ]
 
 
@@ -280,6 +282,114 @@ class GridConfig:
 
     grid_size: int = 32
     margin_frac: float = 0.03
+
+
+def _mapping_get(obj: Any, key: str) -> Any:
+    if obj is None:
+        return None
+    if isinstance(obj, Mapping):
+        return obj.get(key)
+    return getattr(obj, key, None)
+
+
+def _coerce_scalar_or_float_range(value: Any, *, field_name: str) -> ScalarOrFloatRange:
+    """Parse a YAML value into a fixed float or ``(lo, hi)`` pair."""
+    if isinstance(value, (list, tuple)):
+        if len(value) != 2:
+            raise ValueError(
+                f"{field_name}: expected length-2 sequence [lo, hi] or a scalar, got {value!r}"
+            )
+        return (float(value[0]), float(value[1]))
+    if isinstance(value, bool):
+        raise TypeError(f"{field_name}: expected float, int, or [lo, hi], not bool")
+    if isinstance(value, (int, float)):
+        return float(value)
+    raise TypeError(
+        f"{field_name}: expected float, int, or [lo, hi], got {type(value).__name__}"
+    )
+
+
+def _coerce_scalar_or_int_range(value: Any, *, field_name: str) -> ScalarOrIntRange:
+    """Parse a YAML value into a fixed int or ``(lo, hi)`` inclusive int pair."""
+    if isinstance(value, (list, tuple)):
+        if len(value) != 2:
+            raise ValueError(
+                f"{field_name}: expected length-2 sequence [lo, hi] or a scalar, got {value!r}"
+            )
+        return (int(value[0]), int(value[1]))
+    if isinstance(value, bool):
+        raise TypeError(f"{field_name}: expected int or [lo, hi] ints, not bool")
+    if isinstance(value, (int, float)):
+        return int(value)
+    raise TypeError(
+        f"{field_name}: expected int or [lo, hi] ints, got {type(value).__name__}"
+    )
+
+
+def trajectory_config_from_run_config(config: Any, *, n_frames: int) -> TrajectoryConfig:
+    """Merge optional ``PSEUDO_GT_TRAJECTORY`` from run config with defaults.
+
+    ``n_frames`` is always taken from the caller (batch temporal length ``T``),
+    not from YAML, so pseudo clips match the training / val window.
+
+    Parameters
+    ----------
+    config
+        Flat mapping (e.g. DotMap). Reads subtree ``PSEUDO_GT_TRAJECTORY`` if set.
+    n_frames
+        Output trajectory length (typically ``TRACKING_SEQUENCE_LENGTH``).
+    """
+    base = TrajectoryConfig(n_frames=int(n_frames))
+    sec = _mapping_get(config, "PSEUDO_GT_TRAJECTORY")
+    if sec is None:
+        return base
+    overrides: dict = {}
+    for fname in (
+        "z_bias_range",
+        "complexity_range",
+        "translation_range",
+        "rotation_range_deg",
+        "forward_bias_range",
+        "speed_scale_range",
+        "still_fraction_range",
+    ):
+        raw = _mapping_get(sec, fname)
+        if raw is None:
+            continue
+        overrides[fname] = _coerce_scalar_or_float_range(raw, field_name=fname)
+    return replace(base, **overrides) if overrides else base
+
+
+def deformation_config_from_run_config(config: Any) -> DeformationConfig:
+    """Merge optional ``PSEUDO_GT_DEFORMATION`` from run config with defaults."""
+    base = DeformationConfig()
+    sec = _mapping_get(config, "PSEUDO_GT_DEFORMATION")
+    if sec is None:
+        return base
+    overrides: dict = {}
+    raw_nd = _mapping_get(sec, "n_deformers_range")
+    if raw_nd is not None:
+        overrides["n_deformers_range"] = _coerce_scalar_or_int_range(
+            raw_nd, field_name="n_deformers_range",
+        )
+    for fname in (
+        "sigma_frac_range",
+        "amplitude_frac_range",
+        "twist_max_deg_range",
+        "temporal_smooth_range",
+    ):
+        raw = _mapping_get(sec, fname)
+        if raw is None:
+            continue
+        overrides[fname] = _coerce_scalar_or_float_range(raw, field_name=fname)
+    for fname in ("drag_weight", "inflate_weight", "twist_weight"):
+        raw = _mapping_get(sec, fname)
+        if raw is None:
+            continue
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            raise TypeError(f"{fname}: expected float, got {type(raw).__name__}")
+        overrides[fname] = float(raw)
+    return replace(base, **overrides) if overrides else base
 
 
 @dataclass

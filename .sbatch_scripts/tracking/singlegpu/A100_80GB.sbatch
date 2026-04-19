@@ -21,6 +21,12 @@ export WS_DIR=/anvme/workspace/v120bb18-gatetracker
 export DATASET_ROOTDIR=/anvme/workspace/v120bb18-datasets
 export DATASET_DIR="${DATASET_ROOTDIR}"
 
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
+export VECLIB_MAXIMUM_THREADS="${VECLIB_MAXIMUM_THREADS:-1}"
+export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-1}"
+
 module load python
 cd "$WS_DIR"
 source "$WS_DIR/.venv/bin/activate"

@@ -1161,9 +1161,24 @@ def viewPatchMatches(
     if patch_size is not None:
         patch_size_h = patch_size
         patch_size_w = patch_size
-    # Get global min/max for normalization
-    global_min = similarity_matrix.min().cpu()
-    global_max = similarity_matrix.max().cpu()
+    # Global min/max for normalization (ignore NaN/Inf; stable denom for viz)
+    sim_cpu = similarity_matrix.detach().float().cpu()
+    dt = sim_cpu.dtype
+    fin = torch.isfinite(sim_cpu)
+    if bool(fin.any().item()):
+        global_min = sim_cpu.masked_fill(~fin, float("inf")).min()
+        global_max = sim_cpu.masked_fill(~fin, float("-inf")).max()
+    else:
+        global_min = torch.tensor(0.0, dtype=dt)
+        global_max = torch.tensor(1.0, dtype=dt)
+    z = torch.tensor(0.0, dtype=dt)
+    o = torch.tensor(1.0, dtype=dt)
+    eps = torch.tensor(1e-6, dtype=dt)
+    if not torch.isfinite(global_min):
+        global_min = z
+    if not torch.isfinite(global_max):
+        global_max = o
+    denom = (global_max - global_min).clamp_min(eps)
 
     # Select points based on mode
     n = similarity_matrix.shape[0]
@@ -1201,8 +1216,11 @@ def viewPatchMatches(
     canvas.paste(img2_rgba, (w1, 0))
 
     draw = ImageDraw.Draw(canvas, "RGBA")
-    # Normalize scores using global min/max
-    norm_scores = (values - global_min) / (global_max - global_min)
+    # Normalize scores using global min/max; clamp so PIL never sees NaN/Inf
+    values_cpu = values.detach().float().cpu().to(dtype=dt)
+    norm_scores = ((values_cpu - global_min) / denom).nan_to_num(
+        nan=0.5, posinf=1.0, neginf=0.0
+    ).clamp(0.0, 1.0)
 
     display_patch_size = w // topk
     h = max(h1, h2) + 2 * display_patch_size

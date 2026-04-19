@@ -18,6 +18,7 @@ from gatetracker.matching import (
 from gatetracker.geometry import projections
 
 import warnings
+from gatetracker.distributed_context import unwrap_model
 from gatetracker.utils.logger import get_logger
 from gatetracker.utils.training_phase import matcher_should_enable_tracking_head
 from gatetracker.utils.tensor_ops import (
@@ -287,6 +288,7 @@ class Matcher:
         ).lower()
         use_feature_refiner = refinement_method == "feature_softargmax"
         confidence_threshold = self.config.get("PIXEL_MATCHING_SCORE_THRESHOLD", None)
+        backbone = unwrap_model(self.model)
 
         (
             batch_idx_match,
@@ -312,7 +314,7 @@ class Matcher:
         )
         if use_feature_refiner:
             refinement_feature_maps = getattr(
-                self.model, "latest_refinement_feature_maps", {}
+                backbone, "latest_refinement_feature_maps", {}
             )
             source_feature_map = refinement_feature_maps.get("source")
             target_feature_map = refinement_feature_maps.get("target")
@@ -326,7 +328,7 @@ class Matcher:
             refinement_stride = int(
                 self.config.get(
                     "FINE_FEATURE_STRIDE",
-                    getattr(self.model, "fine_feature_stride", 4),
+                    getattr(backbone, "fine_feature_stride", 4),
                 )
             )
             source_pixel_offset, target_pixel_offset, refinement_scores = (
@@ -635,19 +637,20 @@ class Matcher:
 
         B, Q, _ = query_points.shape
         framestack = torch.stack([image1, image2], dim=1)  # [B, 2, 3, H, W]
+        backbone = unwrap_model(self.model)
 
         with torch.no_grad():
             modeloutput = self.model(framestack)
 
-        gated_maps = getattr(self.model, "latest_gated_layer_maps", {})
+        gated_maps = getattr(backbone, "latest_gated_layer_maps", {})
         src_gated = gated_maps.get("source") if gated_maps else None
-        if src_gated is not None and hasattr(self.model, "hierarchical_fusion") and self.model.hierarchical_fusion is not None:
+        if src_gated is not None and hasattr(backbone, "hierarchical_fusion") and backbone.hierarchical_fusion is not None:
             query_embs = correspondence.sample_gated_embeddings_at_points(
                 src_gated["projected_maps"],
                 src_gated["gate_weight_maps"],
                 query_points,
                 self.patch_size,
-                self.model.hierarchical_fusion.output_refine,
+                backbone.hierarchical_fusion.output_refine,
             )  # [B, Q, C]
         else:
             source_map = embedding2chw(
@@ -661,21 +664,21 @@ class Matcher:
         )  # [B, Q, 2]
 
         refinement_feature_maps = getattr(
-            self.model, "latest_refinement_feature_maps", {}
+            backbone, "latest_refinement_feature_maps", {}
         )
         source_feature_map = refinement_feature_maps.get("source")
         target_feature_map = refinement_feature_maps.get("target")
 
         use_tracking_head = (
-            hasattr(self.model, "tracking_head")
-            and self.model.tracking_head is not None
+            hasattr(backbone, "tracking_head")
+            and backbone.tracking_head is not None
         )
 
         if use_tracking_head:
             query_fine = correspondence.sample_embeddings_at_points(
-                source_feature_map, query_points, self.model.fine_feature_stride
+                source_feature_map, query_points, backbone.fine_feature_stride
             )  # [B, Q, C_f]
-            position_delta, visibility_logit, scores_bq = self.model.tracking_head(
+            position_delta, visibility_logit, scores_bq = backbone.tracking_head(
                 query_fine, target_feature_map, coarse_target
             )
             tracked = coarse_target + position_delta  # [B, Q, 2]
@@ -698,7 +701,7 @@ class Matcher:
             refinement_stride = int(
                 self.config.get(
                     "FINE_FEATURE_STRIDE",
-                    getattr(self.model, "fine_feature_stride", 4),
+                    getattr(backbone, "fine_feature_stride", 4),
                 )
             )
             flat_query = query_points.reshape(B * Q, 2)  # [B*Q, 2]
@@ -763,15 +766,16 @@ class Matcher:
         embeddings_list = []
         fine_maps_list = []
         gated_maps_list = []
+        backbone = unwrap_model(self.model)
         with torch.no_grad():
             for t in range(T):
                 (
                     _, matched_tokens, _, _, fine_map, gated_maps_t,
-                ) = self.model._encode_image(frames[:, t])
+                ) = backbone._encode_image(frames[:, t])
                 emb = matched_tokens.permute(0, 2, 1)  # [B, C, N]
-                if self.model.resampled_patch_size != 16:
+                if backbone.resampled_patch_size != 16:
                     emb = chw2embedding(
-                        self.model.patchsize_resampler(embedding2chw(emb, False))
+                        backbone.patchsize_resampler(embedding2chw(emb, False))
                     )
                 embeddings_list.append(emb)
                 fine_maps_list.append(fine_map)
@@ -782,16 +786,16 @@ class Matcher:
         tracks[:, :, 0, :] = query_points
 
         use_tracking_head = (
-            hasattr(self.model, "tracking_head")
-            and self.model.tracking_head is not None
+            hasattr(backbone, "tracking_head")
+            and backbone.tracking_head is not None
         )
 
         for _iter in range(num_refinement_iters):
             current_pts = tracks[:, :, 0, :].clone()  # [B, Q, 2]
 
             has_fusion = (
-                hasattr(self.model, "hierarchical_fusion")
-                and self.model.hierarchical_fusion is not None
+                hasattr(backbone, "hierarchical_fusion")
+                and backbone.hierarchical_fusion is not None
             )
             for t in range(1, T):
                 prev_gated = gated_maps_list[t - 1]
@@ -801,7 +805,7 @@ class Matcher:
                         prev_gated["gate_weight_maps"],
                         current_pts,
                         self.patch_size,
-                        self.model.hierarchical_fusion.output_refine,
+                        backbone.hierarchical_fusion.output_refine,
                     )  # [B, Q, C]
                 else:
                     source_map = embedding2chw(embeddings_list[t - 1], embed_dim_last=False)  # [B, C, H_p, W_p]
@@ -817,9 +821,9 @@ class Matcher:
 
                 if use_tracking_head and src_fine is not None:
                     query_fine = correspondence.sample_embeddings_at_points(
-                        src_fine, current_pts, self.model.fine_feature_stride
+                        src_fine, current_pts, backbone.fine_feature_stride
                     )
-                    delta, v_logit, _ = self.model.tracking_head(
+                    delta, v_logit, _ = backbone.tracking_head(
                         query_fine, tgt_fine, coarse
                     )
                     tracked = coarse + delta
@@ -831,7 +835,7 @@ class Matcher:
                     == "feature_softargmax"
                 ):
                     rw = int(self.config.get("FINE_REFINEMENT_WINDOW_RADIUS", 2))
-                    rs = int(self.config.get("FINE_FEATURE_STRIDE", getattr(self.model, "fine_feature_stride", 4)))
+                    rs = int(self.config.get("FINE_FEATURE_STRIDE", getattr(backbone, "fine_feature_stride", 4)))
                     flat_q = current_pts.reshape(B * Q, 2)
                     flat_c = coarse.reshape(B * Q, 2)
                     flat_b = torch.arange(B, device=device).repeat_interleave(Q)

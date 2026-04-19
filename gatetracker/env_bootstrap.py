@@ -2,7 +2,17 @@
 
 import os
 import sys
+import warnings
 from pathlib import Path
+
+# PyTorch ``torch.utils.checkpoint`` still nests deprecated ``torch.cpu.amp.autocast``;
+# the warning fires during backward recomputation, so it must be filtered globally
+# (not only inside a short-lived ``catch_warnings`` around ``checkpoint()``).
+warnings.filterwarnings(
+    "ignore",
+    category=FutureWarning,
+    message=r".*torch\.cpu\.amp\.autocast.*",
+)
 
 
 def repository_root():
@@ -12,6 +22,23 @@ def repository_root():
 
 def dotenv_file_path():
     return repository_root() / ".env"
+
+
+def setdefault_cpu_thread_env():
+    """Cap BLAS/OpenMP threads per process (DDP / torchrun-friendly).
+
+    Uses ``setdefault`` so values from the shell or ``.env`` (loaded first) win.
+    Aligns with ``torchrun``'s recommendation to set ``OMP_NUM_THREADS=1`` when
+    using many worker processes.
+    """
+    for key, val in (
+        ("OMP_NUM_THREADS", "1"),
+        ("MKL_NUM_THREADS", "1"),
+        ("OPENBLAS_NUM_THREADS", "1"),
+        ("VECLIB_MAXIMUM_THREADS", "1"),
+        ("NUMEXPR_NUM_THREADS", "1"),
+    ):
+        os.environ.setdefault(key, val)
 
 
 def require_dotenv_before_pipeline(purpose="training or evaluation"):
@@ -28,6 +55,7 @@ def require_dotenv_before_pipeline(purpose="training or evaluation"):
     from dotenv import load_dotenv
 
     load_dotenv(env_path)
+    setdefault_cpu_thread_env()
 
 
 def _expand_path(p):
