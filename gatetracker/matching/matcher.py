@@ -874,5 +874,5 @@ class Matcher:
             "visibility": vis_logits,   # [B, Q, T]
         }
 
-    def compute_metrics(self, *args):
-        return metrics.compute_metrics(self, *args)
+    def compute_metrics(self, *args, **kwargs):
+        return metrics.compute_metrics(self, *args, **kwargs)

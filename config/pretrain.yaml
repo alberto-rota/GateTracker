@@ -49,7 +49,7 @@ parameters:
   FEWFRAMES:
     value: False
   RANDOM_POSE_RANGES_OVERRIDE:
-    value: [2.5, 3.25]
+    value: [2.0, 4.5]
   DATASETS:
     value:
       SCARED:
@@ -60,7 +60,7 @@ parameters:
         VAL_VIDEOS: ["test_*"]
         TEST_VIDEOS: [""]
         RANDOM_POSE_TRAINING: True
-        RANDOM_POSE_RANGES: [2.5, 3.25]
+        RANDOM_POSE_RANGES: [2.0, 4.5]
         CURRICULUM_FACTOR: 1
         AUGMENTATION_PROBABILITY: {
           COLOR: 0.8,
@@ -78,10 +78,10 @@ parameters:
         TEST_VIDEOS: ["test_video*"]
         VAL_VIDEOS: ["test_video*"]
         RANDOM_POSE_TRAINING: True
-        RANDOM_POSE_RANGES: [2.5, 3.25]
+        RANDOM_POSE_RANGES: [2.0, 4.5]
         CURRICULUM_FACTOR: 1
         AUGMENTATION_PROBABILITY: {
-          COLOR: 0.0,
+          COLOR: 0.8,
           GEOMETRIC: 0.0,
           REVERSE: 0.0,
           STANDSTILL: 0.0
@@ -172,9 +172,17 @@ parameters:
   FINE_REFINEMENT_LOSS_BETA:
     value: 1.0
   # Entropy-minimization regularizer on fusion gate weights to encourage
-  # layer specialization. 0.0 disables the term.
+  # layer specialization. 0.0 disables the term. Raised from 0.05 to 0.15
+  # to force flatter, more transferable gate distributions and reduce the
+  # train/val gap on ``effective_layer``.
   GATE_ENTROPY_WEIGHT:
-    value: 0.05
+    value: 0.15
+  # Freeze gate sub-modules (``local_gates``, ``register_gates``) for the
+  # first ``GATE_FREEZE_EPOCHS`` training epochs, forcing descriptors and
+  # refinement to work across all DINOv3 layers with a near-uniform gate
+  # before the gate is allowed to specialize. ``0`` disables freezing.
+  GATE_FREEZE_EPOCHS:
+    value: 10
   LOSS_WEIGHT:
     value: {
       Fundamental: 0.8
@@ -197,14 +205,17 @@ parameters:
   # descriptor objective faster than the fusion projections.
   LR_GATE:
     value: 5.0e-4
+  # Nonzero decay is standard for ViT-based setups with a trainable backbone.
   WEIGHT_DECAY:
-    value: 0.0
+    value: 1.0e-4
   GRADIENT_ACCUMULATION_STEPS:
     value: 1
   EPOCHS:
     value: 200
   WARMUP_STEPS:
     value: 0
+  # TODO: drop to 25 once the unified ``Loss == EpipolarError`` signal has
+  # stabilized in wandb and the val curve is visibly smoother.
   EARLYSTOPPING_PATIENCE:
     value: 50
   LR_SCHEDULER:

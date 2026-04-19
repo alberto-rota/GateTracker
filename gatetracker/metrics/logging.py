@@ -69,6 +69,7 @@ def register_wandb_step_axes(wb: Any) -> None:
         wb.define_metric(f"{phase}/images/*", step_metric=sm)
         for sub in arch_sub:
             wb.define_metric(f"{phase}/{sub}/*", step_metric=sm)
+        wb.define_metric(f"{phase}/gate/per_layer/*", step_metric=sm)
         wb.define_metric(f"{phase}/tracking/self_sup/*", step_metric=sm)
         wb.define_metric(f"{phase}/tracking/pseudo_gt/*", step_metric=sm)
 
@@ -93,12 +94,14 @@ def register_wandb_step_axes(wb: Any) -> None:
 
 
 METRIC_CATEGORIES = {
+    "TotalLoss": "loss",
     "Loss": "loss",
     "InfoNCE": "loss",
     "Fundamental": "loss",
     "Refinement_loss": "loss",
     "tracking_loss": "loss",
 
+    "PrimaryMetric": "matching",
     "F1": "matching",
     "InlierRatio": "matching",
     "NCM": "matching",

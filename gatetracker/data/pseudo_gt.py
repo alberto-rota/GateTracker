@@ -41,10 +41,12 @@ __all__ = [
     "TrajectoryConfig",
     "DeformationConfig",
     "GridConfig",
+    "OccluderConfig",
     "PseudoGTResult",
     "PseudoGTGenerator",
     "trajectory_config_from_run_config",
     "deformation_config_from_run_config",
+    "occluder_config_from_run_config",
 ]
 
 
@@ -269,6 +271,61 @@ class DeformationConfig:
 
 
 @dataclass
+class OccluderConfig:
+    """Stochastic 2-D occluder sprites composited into the rendered clip.
+
+    Occluders produce **dense pixel-accurate visibility negatives**: the
+    novel-view depth-only visibility almost never flags occlusions (single
+    depth layer, small parallax, smooth deformations), so the BCE head has
+    no negatives to learn from.  Each occluder is a soft Gaussian blob that
+
+    * moves along a straight line (with optional sinusoidal perturbation),
+    * has a raised-cosine temporal lifetime (fades in / out),
+    * is alpha-composited on top of the warped frames,
+    * marks any query whose ``(u, v)`` falls under ``alpha > vis_alpha_threshold``
+      as ``visibility = False`` at that frame,
+    * multiplies ``frame_valid`` by ``(1 - alpha)`` so downstream masks
+      discard the occluded pixels for position / descriptor losses.
+
+    Attributes
+    ----------
+    n_range
+        Number of occluders sampled per clip (inclusive int range).
+        ``[0, 0]`` disables the feature.
+    size_frac_range
+        Gaussian sigma as a fraction of ``min(H, W)``.
+    motion_frac_range
+        Displacement from start to end centre as a fraction of ``min(H, W)``.
+        Sampled per occluder; the direction is uniform on the unit circle.
+    sinusoid_frac_range
+        Amplitude of a sinusoidal perpendicular perturbation added to the
+        linear path (fraction of ``min(H, W)``); ``0`` disables.
+    lifetime_frac_range
+        Fraction of the window length ``T`` that each occluder is active.
+    appearance_value_range
+        Per-channel RGB value range for the solid-colour base of the sprite.
+    appearance_noise_std
+        Per-pixel additive Gaussian noise std on top of the base colour
+        (keeps the appearance non-trivial so the backbone can't cheat on
+        "flat colour → occluded"); clamped to ``[0, 1]`` after compositing.
+    vis_alpha_threshold
+        Query is marked occluded when sampled ``alpha >`` this value.
+    apply_to_frame_valid
+        When ``True``, multiplies ``frame_valid`` by ``(1 - alpha)``.
+    """
+
+    n_range: ScalarOrIntRange = (1, 3)
+    size_frac_range: ScalarOrFloatRange = (0.05, 0.15)
+    motion_frac_range: ScalarOrFloatRange = (0.0, 0.5)
+    sinusoid_frac_range: ScalarOrFloatRange = (0.0, 0.05)
+    lifetime_frac_range: ScalarOrFloatRange = (0.3, 0.9)
+    appearance_value_range: ScalarOrFloatRange = (0.0, 1.0)
+    appearance_noise_std: float = 0.05
+    vis_alpha_threshold: float = 0.5
+    apply_to_frame_valid: bool = True
+
+
+@dataclass
 class GridConfig:
     """Dense query-point grid layout.
 
@@ -392,6 +449,58 @@ def deformation_config_from_run_config(config: Any) -> DeformationConfig:
     return replace(base, **overrides) if overrides else base
 
 
+def occluder_config_from_run_config(config: Any) -> Optional["OccluderConfig"]:
+    """Merge optional ``PSEUDO_GT_OCCLUDERS`` from run config with defaults.
+
+    Returns ``None`` when the config block is absent **or** when
+    ``n_range`` explicitly disables occluders (max ≤ 0). Returning ``None``
+    is the canonical "feature off" signal consumed by :meth:`generate`.
+    """
+    sec = _mapping_get(config, "PSEUDO_GT_OCCLUDERS")
+    if sec is None:
+        return None
+    base = OccluderConfig()
+    overrides: dict = {}
+
+    raw_n = _mapping_get(sec, "n_range")
+    if raw_n is not None:
+        overrides["n_range"] = _coerce_scalar_or_int_range(
+            raw_n, field_name="n_range",
+        )
+
+    for fname in (
+        "size_frac_range",
+        "motion_frac_range",
+        "sinusoid_frac_range",
+        "lifetime_frac_range",
+        "appearance_value_range",
+    ):
+        raw = _mapping_get(sec, fname)
+        if raw is None:
+            continue
+        overrides[fname] = _coerce_scalar_or_float_range(raw, field_name=fname)
+
+    for fname in ("appearance_noise_std", "vis_alpha_threshold"):
+        raw = _mapping_get(sec, fname)
+        if raw is None:
+            continue
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            raise TypeError(f"{fname}: expected float, got {type(raw).__name__}")
+        overrides[fname] = float(raw)
+
+    raw = _mapping_get(sec, "apply_to_frame_valid")
+    if raw is not None:
+        overrides["apply_to_frame_valid"] = bool(raw)
+
+    cfg = replace(base, **overrides) if overrides else base
+
+    # "n_range max <= 0" → feature explicitly disabled.
+    n_hi = cfg.n_range[1] if isinstance(cfg.n_range, tuple) else cfg.n_range
+    if int(n_hi) <= 0:
+        return None
+    return cfg
+
+
 @dataclass
 class PseudoGTResult:
     """Complete output of a single pseudo ground-truth generation call.
@@ -459,6 +568,7 @@ class PseudoGTGenerator:
         trajectory: Optional[TrajectoryConfig] = None,
         deformation: Optional[DeformationConfig] = None,
         grid: Optional[GridConfig] = None,
+        occluders: Optional[OccluderConfig] = None,
         seed: Optional[int] = None,
         randomize_trajectory: bool = True,
         visibility_z_tol_frac: float = 0.08,
@@ -481,6 +591,9 @@ class PseudoGTGenerator:
         trajectory : TrajectoryConfig, optional
         deformation : DeformationConfig, optional
         grid : GridConfig, optional
+        occluders : OccluderConfig, optional
+            Stochastic 2-D sprite occluders; ``None`` disables the feature
+            (default, matches the pre-occluder behaviour).
         seed : int, optional
             Seeds the main RNG (deformation, etc.).  If *None*, non-deterministic.
         randomize_trajectory : bool, default ``True``
@@ -608,9 +721,25 @@ class PseudoGTGenerator:
             frame_valid_stack, frame_valid_erode_px
         )
 
+        frames_stack = torch.cat(all_frames, dim=0)  # [T, 3, H, W]
+        tracks_stack = torch.cat(all_tracks, dim=0)  # [T, Q, 2]
+
+        if occluders is not None:
+            frames_stack, vis_stack, frame_valid_stack = (
+                PseudoGTGenerator._apply_occluders(
+                    frames=frames_stack,
+                    tracks=tracks_stack,
+                    visibility=vis_stack,
+                    frame_valid=frame_valid_stack,
+                    cfg=occluders,
+                    rng=rng,
+                    device=dev,
+                )
+            )
+
         return PseudoGTResult(
-            frames=torch.cat(all_frames, dim=0),       # [T, 3, H, W]
-            tracks=torch.cat(all_tracks, dim=0),        # [T, Q, 2]
+            frames=frames_stack,                         # [T, 3, H, W]
+            tracks=tracks_stack,                          # [T, Q, 2]
             visibility=vis_stack,                        # [T, Q]
             query_pixels=Q0_px.squeeze(0),               # [Q, 2]
             frame_valid=frame_valid_stack,
@@ -849,6 +978,195 @@ class PseudoGTGenerator:
             return out
 
         return _deform
+
+    # ── synthetic occluders ─────────────────────────────────────────────
+
+    @staticmethod
+    def _apply_occluders(
+        frames: torch.Tensor,        # [T, 3, H, W] float in [0, 1]
+        tracks: torch.Tensor,        # [T, Q, 2] pixel coords (x, y)
+        visibility: torch.Tensor,    # [T, Q] bool
+        frame_valid: torch.Tensor,   # [T, 1, H, W] float
+        cfg: "OccluderConfig",
+        rng: torch.Generator,
+        device,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Composite stochastic 2-D occluder sprites into the rendered clip.
+
+        Produces dense pixel-accurate visibility negatives for the BCE head.
+
+        Pipeline (fully vectorized across frames and pixels; Python loop only
+        over the small number of occluders K ≤ max(n_range) ≈ 5):
+
+        1. Sample K occluders, each with a linear-plus-sinusoidal 2-D centre
+           trajectory, a raised-cosine temporal lifetime envelope, a solid
+           base colour and small per-pixel Gaussian noise.
+        2. Build per-frame alpha  ``α_t(x, y) ∈ [0, 1]``  via the
+           order-independent over approximation
+           ``α = 1 - ∏_k (1 - α_k)`` and a corresponding RGB weighted
+           by each sprite's alpha contribution.
+        3. Blend   ``I'_t = I_t (1 - α_t) + C_t α_t``.
+        4. Sample ``α_t`` at each track location (bilinear) and mark
+           ``visibility[t, q] = False`` where ``α > vis_alpha_threshold``.
+        5. Multiply ``frame_valid *= (1 - α)`` (optional) so that downstream
+           composite supervision masks also discard occluded positions.
+
+        Returns:
+            frames_out  [T, 3, H, W]
+            vis_out     [T, Q]  bool
+            valid_out   [T, 1, H, W]
+        """
+        T, _, H, W = frames.shape
+        _, Q, _ = tracks.shape
+
+        n_range = cfg.n_range if isinstance(cfg.n_range, tuple) else (int(cfg.n_range), int(cfg.n_range))
+        K = _uniform_int(rng, int(n_range[0]), int(n_range[1]), device)
+        if K <= 0:
+            return frames, visibility, frame_valid
+
+        min_dim = float(min(H, W))
+
+        # Per-occluder sampled parameters --------------------------------
+        sizes_px = torch.stack([
+            torch.tensor(
+                _sample_f(rng, cfg.size_frac_range, device) * min_dim,
+                device=device, dtype=torch.float32,
+            )
+            for _ in range(K)
+        ])  # [K]  (Gaussian sigma in pixels)
+
+        motion_frac = torch.stack([
+            torch.tensor(_sample_f(rng, cfg.motion_frac_range, device),
+                         device=device, dtype=torch.float32)
+            for _ in range(K)
+        ])  # [K]
+        sinusoid_frac = torch.stack([
+            torch.tensor(_sample_f(rng, cfg.sinusoid_frac_range, device),
+                         device=device, dtype=torch.float32)
+            for _ in range(K)
+        ])  # [K]
+        life_frac = torch.stack([
+            torch.tensor(_sample_f(rng, cfg.lifetime_frac_range, device),
+                         device=device, dtype=torch.float32)
+            for _ in range(K)
+        ])  # [K]
+        base_rgb = torch.stack([
+            torch.tensor(
+                [_sample_f(rng, cfg.appearance_value_range, device) for _ in range(3)],
+                device=device, dtype=torch.float32,
+            )
+            for _ in range(K)
+        ])  # [K, 3]
+
+        # Start / end pixel centres (allow sliding from slightly off-screen).
+        margin = 0.15 * min_dim
+        start_px = torch.stack([
+            torch.stack([
+                torch.rand((), device=device, generator=rng) * (W + 2 * margin) - margin,
+                torch.rand((), device=device, generator=rng) * (H + 2 * margin) - margin,
+            ])
+            for _ in range(K)
+        ])  # [K, 2]
+        # Uniform direction on the circle × motion_frac * min_dim
+        theta = torch.stack([
+            torch.rand((), device=device, generator=rng) * 2.0 * torch.pi
+            for _ in range(K)
+        ])  # [K]
+        direction = torch.stack([theta.cos(), theta.sin()], dim=-1)  # [K, 2]
+        end_px = start_px + direction * (motion_frac.unsqueeze(-1) * min_dim)
+
+        # Sinusoid phase + unit-normal perpendicular to direction
+        phase = torch.stack([
+            torch.rand((), device=device, generator=rng) * 2.0 * torch.pi
+            for _ in range(K)
+        ])  # [K]
+        perp = torch.stack([-direction[:, 1], direction[:, 0]], dim=-1)  # [K, 2]
+
+        # Temporal lifetime: raised-cosine bump of half-width = life_frac * T / 2
+        # centred at a random frame inside the clip.
+        t_mid = torch.stack([
+            torch.tensor(
+                _uniform(rng, 0.0, float(T - 1), device),
+                device=device, dtype=torch.float32,
+            )
+            for _ in range(K)
+        ])  # [K]
+        t_half = (life_frac * float(T) / 2.0).clamp_min(1.0)  # [K]
+
+        t_idx = torch.arange(T, device=device, dtype=torch.float32)  # [T]
+        u = t_idx.view(1, T) / max(T - 1, 1)  # [1, T]  normalised 0..1 for traj param
+        # Centres: [K, T, 2]
+        centres = (
+            start_px.unsqueeze(1) * (1.0 - u.unsqueeze(-1))
+            + end_px.unsqueeze(1) * u.unsqueeze(-1)
+            + perp.unsqueeze(1) * (
+                (sinusoid_frac * min_dim).view(K, 1, 1)
+                * torch.sin(u.unsqueeze(-1) * 2.0 * torch.pi + phase.view(K, 1, 1))
+            )
+        )  # [K, T, 2]
+
+        # Raised-cosine active envelope: cos^2(π/2 · phase) inside window, 0 outside
+        phase_t = (t_idx.view(1, T) - t_mid.view(K, 1)) / t_half.view(K, 1)  # [K, T]
+        in_window = (phase_t.abs() <= 1.0).float()
+        active = torch.cos(0.5 * torch.pi * phase_t.clamp(-1.0, 1.0)) ** 2 * in_window  # [K, T]
+
+        # Per-occluder alpha and accumulated over-composite ---------------
+        yy = torch.arange(H, device=device, dtype=torch.float32).view(1, H, 1)
+        xx = torch.arange(W, device=device, dtype=torch.float32).view(1, 1, W)
+
+        alpha_acc = torch.zeros(T, H, W, device=device, dtype=torch.float32)
+        rgb_acc = torch.zeros(T, 3, H, W, device=device, dtype=torch.float32)
+        w_acc = torch.zeros(T, H, W, device=device, dtype=torch.float32)
+
+        for k in range(K):
+            cx = centres[k, :, 0].view(T, 1, 1)  # [T, 1, 1]
+            cy = centres[k, :, 1].view(T, 1, 1)
+            s2 = (2.0 * sizes_px[k].clamp_min(1.0) ** 2)
+            alpha_k = torch.exp(-((xx - cx) ** 2 + (yy - cy) ** 2) / s2)  # [T, H, W]
+            alpha_k = alpha_k * active[k].view(T, 1, 1)
+            # Unconditional numerical clamp against fp drift
+            alpha_k = alpha_k.clamp(0.0, 1.0)
+
+            rgb_k = base_rgb[k].view(1, 3, 1, 1).expand(T, 3, H, W)
+            rgb_acc = rgb_acc + rgb_k * alpha_k.unsqueeze(1)
+            w_acc = w_acc + alpha_k
+            alpha_acc = alpha_acc + alpha_k * (1.0 - alpha_acc)
+
+        alpha = alpha_acc.clamp(0.0, 1.0)                 # [T, H, W]
+        occ_rgb = rgb_acc / w_acc.clamp_min(1e-6).unsqueeze(1)  # [T, 3, H, W]
+
+        # Optional per-pixel noise for appearance diversity (clamped 0..1).
+        noise_std = float(cfg.appearance_noise_std)
+        if noise_std > 0.0:
+            noise = torch.randn(
+                T, 3, H, W, device=device, dtype=torch.float32, generator=rng,
+            ) * noise_std
+            occ_rgb = (occ_rgb + noise).clamp(0.0, 1.0)
+
+        # Composite into RGB ---------------------------------------------
+        alpha_bchw = alpha.unsqueeze(1)  # [T, 1, H, W]
+        frames_out = frames * (1.0 - alpha_bchw) + occ_rgb * alpha_bchw
+        frames_out = frames_out.clamp(0.0, 1.0)
+
+        # Sample alpha at each track location (bilinear) -----------------
+        # tracks: [T, Q, 2] in pixel coords (x, y). Build a per-frame grid
+        # of shape [T, Q, 1, 2] normalised to [-1, 1].
+        gx = 2.0 * tracks[..., 0].clamp(0.0, float(max(W - 1, 1))) / float(max(W - 1, 1)) - 1.0
+        gy = 2.0 * tracks[..., 1].clamp(0.0, float(max(H - 1, 1))) / float(max(H - 1, 1)) - 1.0
+        grid = torch.stack([gx, gy], dim=-1).unsqueeze(2)  # [T, Q, 1, 2]
+        alpha_at_q = F.grid_sample(
+            alpha_bchw, grid, mode="bilinear", padding_mode="zeros", align_corners=True,
+        ).squeeze(1).squeeze(-1)  # [T, Q]
+
+        covered = alpha_at_q > float(cfg.vis_alpha_threshold)  # [T, Q]
+        vis_out = visibility & (~covered)
+
+        if cfg.apply_to_frame_valid:
+            valid_out = (frame_valid * (1.0 - alpha_bchw)).clamp(0.0, 1.0)
+        else:
+            valid_out = frame_valid
+
+        return frames_out, vis_out, valid_out
 
     # ── validity (novel-view holes) ─────────────────────────────────────
 

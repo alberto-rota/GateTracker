@@ -341,9 +341,10 @@ parameters:
     value: 0.75
   TEMPORAL_VIS_REG_WEIGHT:
     value: 0.1
-  # Lower entropy pull so visibility can stay sharp for occlusions (was fixed 0.1 in code).
+  # With dense occluder-labelled negatives we no longer need an anti-collapse
+  # pull toward 0.5: set this to 0 so BCE can drive logits to be sharp.
   TEMPORAL_VIS_REG_ENTROPY_SCALE:
-    value: 0.04
+    value: 0.0
 
   # ===== TRACKING OPTIMIZER =====
   # ``LEARNING_RATE`` (1e-5) is sized for descriptor pretraining; using it
@@ -374,7 +375,7 @@ parameters:
   TRACKING_VAL_PSEUDO_GRID_SIZE:
     value: 8
   TRACKING_VAL_PSEUDO_SPARSE_STRIDE:
-    value: 32
+    value: 2
   TRACKING_VAL_PSEUDO_MAX_POINTS:
     value: 64
   TRACKING_VAL_PSEUDO_BATCH_INDEX:
@@ -387,7 +388,7 @@ parameters:
   # absolute positions (cycle/smoothness/desc losses are local), so it is
   # weighted significantly stronger than the descriptor-pretrain default.
   PSEUDO_GT_MIX:
-    value: 0.5
+    value: 0.8
   PSEUDO_GT_SUP_LAMBDA_MAX:
     value: 0.5
   PSEUDO_GT_CURRICULUM_EPOCHS:
@@ -420,6 +421,24 @@ parameters:
       twist_weight: 0.2
       twist_max_deg_range: [1.0, 5.0]
       temporal_smooth_range: [2.0, 6.0]
+  # Synthetic 2-D occluder sprites composited into the pseudo-GT clips.
+  # These provide the **dense pixel-accurate visibility negatives** the BCE
+  # head is starved of: the depth-only visibility test on a single-layer
+  # novel-view almost never flags occluded queries, so without this block
+  # the visibility head collapses to "always visible" and tracked points
+  # drift wildly once they are occluded in real inference videos. Disable
+  # by setting ``n_range: [0, 0]`` (or removing the block entirely).
+  PSEUDO_GT_OCCLUDERS:
+    value:
+      n_range: [1, 3]
+      size_frac_range: [0.05, 0.15]
+      motion_frac_range: [0.0, 0.5]
+      sinusoid_frac_range: [0.0, 0.05]
+      lifetime_frac_range: [0.3, 0.9]
+      appearance_value_range: [0.0, 1.0]
+      appearance_noise_std: 0.05
+      vis_alpha_threshold: 0.5
+      apply_to_frame_valid: true
   PSEUDO_GT_VIS_APPEARANCE_AWARE:
     value: False
   PSEUDO_GT_SYNTH_SELF_SUP_SCALE:

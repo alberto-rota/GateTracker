@@ -66,6 +66,51 @@ def propagate_points_nearest(
     return points_next
 
 
+def _reencode_mp4_for_browser(path: str) -> None:
+    """Replace OpenCV ``mp4v`` output at *path* with H.264 when ffmpeg exists.
+
+    MPEG-4 Part 2 in MP4 is poorly supported by Chromium/WebKit HTML5 preview and
+    some logging UIs; matches ``pseudo_gt.render_video`` post-processing.
+    """
+    import shutil
+    import subprocess
+    import tempfile
+
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        return
+    fd, tmp_out = tempfile.mkstemp(suffix=".mp4")
+    os.close(fd)
+    try:
+        subprocess.run(
+            [
+                ffmpeg,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                path,
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                "-crf",
+                "23",
+                tmp_out,
+            ],
+            check=True,
+        )
+        os.replace(tmp_out, path)
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        try:
+            os.unlink(tmp_out)
+        except OSError:
+            pass
+
+
 def _error_to_bgr(error_px: float, max_error: float = 16.0) -> tuple[int, int, int]:
     """Map a pixel error to a BGR color on a green -> yellow -> red gradient.
 
@@ -212,6 +257,7 @@ def render_tracks_video(
         writer.write(frame_bgr)
 
     writer.release()
+    _reencode_mp4_for_browser(output_path)
     return output_path
 
 
@@ -387,6 +433,7 @@ def render_comparison_video(
         writer.write(frame_bgr)
 
     writer.release()
+    _reencode_mp4_for_browser(output_path)
     return output_path
 
 

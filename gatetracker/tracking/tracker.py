@@ -501,6 +501,7 @@ class TemporalTracker(nn.Module):
             GridConfig,
             PseudoGTGenerator,
             deformation_config_from_run_config,
+            occluder_config_from_run_config,
             trajectory_config_from_run_config,
         )
         from gatetracker.tracking.losses import (
@@ -548,6 +549,7 @@ class TemporalTracker(nn.Module):
             erode = int(config.get("PSEUDO_GT_MASK_ERODE_PX", 0))
             traj_cfg = trajectory_config_from_run_config(config, n_frames=T)
             deform_cfg = deformation_config_from_run_config(config)
+            occ_cfg = occluder_config_from_run_config(config)
 
             with torch.no_grad():
                 depth, _, K = geometry_pipeline.compute_geometry(
@@ -570,6 +572,7 @@ class TemporalTracker(nn.Module):
                     trajectory=traj_cfg,
                     deformation=deform_cfg,
                     grid=grid_cfg,
+                    occluders=occ_cfg,
                     seed=seed_u,
                     frame_valid_erode_px=erode,
                 )

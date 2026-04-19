@@ -538,6 +538,7 @@ def compute_metrics(
     scores,
     fundamental_pred,
     fundamental_gt,
+    descriptor_scores=None,
 ):
     """
     Compute various metrics for evaluating matching performance.
@@ -548,12 +549,19 @@ def compute_metrics(
         target_pixels_matched: Predicted target pixel coordinates
         true_pixels_matched: Ground truth target pixel coordinates
         batch_idx_match: Batch indices for each match
-        scores: Confidence scores for each match
+        scores: Confidence scores for each match (descriptor + refinement + epipolar
+            combination; refinement component is zeroed for below-threshold
+            matches when ``PIXEL_MATCHING_SCORE_THRESHOLD`` is active).
         fundamental_pred: Predicted fundamental matrix
         fundamental_gt: Ground truth fundamental matrix (may be zeros if GT poses unavailable)
+        descriptor_scores: Optional raw descriptor cosine-similarity scores for each
+            match (shape: ``[M]``). When provided, a threshold-free AUCPR
+            (``AUCPR_unthresholded``) is computed using these raw similarities
+            as the confidence, bypassing the effect of
+            ``PIXEL_MATCHING_SCORE_THRESHOLD`` on the combined score.
 
     Returns:
-        dict: Dictionary containing all computed metrics
+        dict: Dictionary containing all computed metrics.
     """
     fundamental_gt_norm = torch.norm(fundamental_gt.reshape(fundamental_gt.shape[0], -1), dim=1)
     has_valid_fundamental_gt = torch.all(fundamental_gt_norm > 1e-6).item()
@@ -570,6 +578,19 @@ def compute_metrics(
         fundamental_for_epipolar,
         include_curve_means=False,
     )
+
+    aucpr_unthresholded = None
+    if descriptor_scores is not None and descriptor_scores.numel() > 0:
+        _, _, aucpr_unthresholded = precision_recall(
+            source_pixels_matched.detach(),
+            target_pixels_matched.detach(),
+            true_pixels_matched.detach() if true_pixels_matched is not None else None,
+            batch_idx_match.detach(),
+            descriptor_scores.detach(),  # [M] raw cosine similarities
+            mp.config.MAX_EPIPOLAR_DISTANCE,
+            fundamental_for_epipolar,
+            include_curve_means=False,
+        )
 
     epipolar = epipolar_error(
         source_pixels_matched.cpu(),
@@ -594,6 +615,7 @@ def compute_metrics(
 
     return {
         "AUCPR": AUCPR,
+        "AUCPR_unthresholded": aucpr_unthresholded,
         "EpipolarError": epipolar,
         "MDistMean": mean_match_distance,
         **refine_metrics,

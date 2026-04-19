@@ -19,9 +19,11 @@ from gatetracker.data.pseudo_gt import (
     TrajectoryConfig,
     DeformationConfig,
     GridConfig,
+    OccluderConfig,
     PseudoGTResult,
     deformation_config_from_run_config,
     trajectory_config_from_run_config,
+    occluder_config_from_run_config,
 )
 
 __all__ = [
@@ -40,7 +42,9 @@ __all__ = [
     "TrajectoryConfig",
     "DeformationConfig",
     "GridConfig",
+    "OccluderConfig",
     "PseudoGTResult",
     "deformation_config_from_run_config",
     "trajectory_config_from_run_config",
+    "occluder_config_from_run_config",
 ]

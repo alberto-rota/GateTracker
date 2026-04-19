@@ -309,6 +309,36 @@ class Engine:
         T = T0 + (T_final - T0) * frac
         fusion.set_gate_temperature(T)
 
+    def _apply_gate_freeze(self, epoch: int) -> None:
+        """Freeze the hierarchical-fusion gate parameters for the first
+        ``GATE_FREEZE_EPOCHS`` training epochs.
+
+        During the freeze window, ``local_gates`` and ``register_gates``
+        parameters have ``requires_grad = False`` so descriptors and refinement
+        are forced to work across all DINOv3 layers with a near-uniform gate
+        (after the register-gate zero-init + tanh clamp in ``fusion.py``).
+        Once the epoch counter crosses the threshold, gate parameters become
+        trainable again so the gate can specialize under the entropy regularizer.
+
+        A value of ``0`` (default when the key is absent from the config) is a
+        no-op for every epoch, preserving backward compatibility with existing
+        checkpoints / configs.
+        """
+        gate_freeze_epochs = int(self.config.get("GATE_FREEZE_EPOCHS", 0))
+        if gate_freeze_epochs <= 0:
+            return
+        model = unwrap_model(self.matcher.model)
+        fusion = getattr(model, "hierarchical_fusion", None)
+        if fusion is None:
+            return
+        should_train = epoch >= gate_freeze_epochs
+        for gate_list_name in ("local_gates", "register_gates"):
+            gate_list = getattr(fusion, gate_list_name, None)
+            if gate_list is None:
+                continue
+            for param in gate_list.parameters():
+                param.requires_grad_(should_train)
+
     def _compute_gate_entropy_loss(
         self,
     ) -> Tuple[Optional[torch.Tensor], Optional[float]]:
@@ -528,6 +558,8 @@ class Engine:
         warmup_base_lrs = [float(g["lr"]) for g in self.optimizer.param_groups]
 
         self._anneal_gate_temperature(epoch)
+        if TRAINING:
+            self._apply_gate_freeze(epoch)
 
         if len(dataloader) == 0:
             if is_main_process():
@@ -642,6 +674,16 @@ class Engine:
                     ),
                     target_only=True,
                 )
+                # Target-only photometric noise: adds brightness / contrast jitter,
+                # per-pixel Gaussian noise, mild blur and gamma shifts to the
+                # NVS-warped target view (``synthetic_framestack[:, 1]``) so the
+                # descriptor head sees appearance variation that mimics real
+                # frame-to-frame differences. Disabled at validation / test time.
+                if TRAINING:
+                    synthetic_framestack = photometric_noise_augmentation(
+                        synthetic_framestack,
+                        target_only=True,
+                    )
                 descriptors = self.matcher.model(synthetic_framestack)
 
                 loss_value = None
@@ -821,6 +863,7 @@ class Engine:
                     scores,
                     fundamental_pred,
                     fundamental_gt,
+                    descriptor_scores=descriptor_scores,
                 )
                 inlier_percentage = inliers.count_nonzero().item() / inliers.numel()
                 metrics = {
@@ -835,11 +878,14 @@ class Engine:
 
                 metrics.update(
                     {
-                        "Loss": (
-                            loss_value
-                            if TRAINING
-                            else (metrics.get("EpipolarError") if VALIDATION else None)
-                        ),
+                        # Unified Loss = EpipolarError (pixels) in both phases so that
+                        # `Training/epoch/Loss` and `Validation/epoch/Loss` are directly
+                        # comparable. The optimization target `loss_tensor` (descriptor +
+                        # refinement + optional tracking/gate-entropy) is unchanged; its
+                        # scalar is logged separately as `TotalLoss` for training.
+                        "Loss": metrics.get("EpipolarError"),
+                        "PrimaryMetric": metrics.get("EpipolarError"),
+                        "TotalLoss": loss_value if TRAINING else None,
                         "DescriptorLoss": descriptor_loss_value if TRAINING else None,
                         "TrackingLoss": tracking_loss_value if TRAINING else None,
                         "RefinementLoss": refinement_loss_value if TRAINING else None,
@@ -983,7 +1029,12 @@ class Engine:
         epoch_df_slice = self.metrics[PHASE][
             self.metrics[PHASE][f"Step/{epochstr}"] == epoch
         ]
-        epoch_mean_series = epoch_df_slice.mean()
+        # Drop columns whose values are entirely None/NaN for this phase+epoch
+        # slice (e.g. `DescriptorLoss`, `RefinementLoss`, `TrackingLoss`,
+        # `GateEntropyLoss`, `MDistMean`, ... during Validation). Without this
+        # filter pandas propagates them as "NaN" strings into W&B.
+        epoch_df_slice = epoch_df_slice.dropna(axis=1, how="all")
+        epoch_mean_series = epoch_df_slice.mean(numeric_only=True)
         epoch_mean_dict = epoch_mean_series.to_dict()
         del epoch_df_slice, epoch_mean_series
 
@@ -1734,6 +1785,26 @@ class Engine:
             )
             metrics["gate/weight_shallow"] = shallow_weights.mean().item()
             metrics["gate/weight_deep"] = deep_weights.mean().item()
+
+            # Per-layer mean gate weight across batch + patch dims, keyed by
+            # the absolute DINOv3 layer index:
+            #   layer_weights: [B_all, L, N]  ->  per_layer_mean: [L]
+            per_layer_mean = layer_weights.mean(dim=(0, 2))  # [L]
+            layer_index_source = None
+            for diag in (source_diag, target_diag):
+                if diag is not None and diag.get("layer_indices") is not None:
+                    layer_index_source = diag["layer_indices"]
+                    break
+            if layer_index_source is not None:
+                layer_id_list = [int(i) for i in layer_index_source.tolist()]
+            else:
+                layer_id_list = list(range(num_layers))
+            per_layer_values = per_layer_mean.detach().cpu().tolist()  # length L
+            # Python loop over at most L (=24) metric names is unavoidable:
+            # the tensor reductions above are already vectorized; this is only
+            # populating a scalar metric dict.
+            for layer_id, val in zip(layer_id_list, per_layer_values):
+                metrics[f"gate/per_layer/layer_{layer_id:02d}"] = val
             layer_index_tensors = []
             if source_diag is not None and source_diag.get("layer_weights") is not None:
                 layer_index_tensors.append(
@@ -2964,6 +3035,7 @@ class Engine:
             GridConfig,
             PseudoGTGenerator,
             deformation_config_from_run_config,
+            occluder_config_from_run_config,
             trajectory_config_from_run_config,
         )
         from gatetracker.tracking.losses import (
@@ -2993,6 +3065,7 @@ class Engine:
         gen = PseudoGTGenerator(H, W, device=str(self.device))
         traj_cfg = trajectory_config_from_run_config(self.config, n_frames=T)
         deform_cfg = deformation_config_from_run_config(self.config)
+        occ_cfg = occluder_config_from_run_config(self.config)
         with torch.no_grad():
             depth, _, K = self.geometryPipeline.compute_geometry(
                 frames[:, 0], return_normalized=False,
@@ -3007,7 +3080,8 @@ class Engine:
                 grid_size=grid_sz,
                 margin_frac=float(self.config.get("PSEUDO_GT_GRID_MARGIN_FRAC", 0.03)),
             ),
-            seed=seed,
+            occluders=occ_cfg,
+            # seed=seed,
             randomize_trajectory=False,
             frame_valid_erode_px=int(self.config.get("PSEUDO_GT_MASK_ERODE_PX", 0)),
         )
