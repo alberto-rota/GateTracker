@@ -64,35 +64,48 @@ def _contour_centers_from_seg(seg_path: str) -> np.ndarray:
     return centers
 
 
-def _read_mp4_rgb_uint8(path: str) -> torch.Tensor:
-    """Decode MP4 to ``[T, H, W, C]`` uint8 RGB.
+def _read_mp4_rgb_uint8(
+    path: str,
+    start: int = 0,
+    stop: Optional[int] = None,
+    step: int = 1,
+) -> torch.Tensor:
+    """Decode selected MP4 frames to ``[T, H, W, C]`` uint8 RGB.
 
-    Prefer ``torchvision.io.read_video`` when PyAV is available; otherwise fall
-    back to OpenCV (already required by this repo) so STIR eval does not hard-fail.
+    Frames are sampled online (``start:stop:step``) during decode so we do not
+    materialize long full clips in memory before slicing.
     """
-    from torchvision.io import read_video
+    start = max(int(start), 0)
+    step = max(int(step), 1)
+    stop_i = None if stop is None else max(int(stop), 0)
 
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video: {path}")
+
+    frames: list[np.ndarray] = []
+    frame_idx = 0
     try:
-        vid, _, _ = read_video(path, pts_unit="sec")  # [T0, H0, W0, C] uint8
-    except ImportError:
-        import cv2
-
-        cap = cv2.VideoCapture(path)
-        if not cap.isOpened():
-            raise RuntimeError(f"Could not open video (cv2 fallback): {path}") from None
-        frames: list[np.ndarray] = []
         while True:
             ok, frame = cap.read()
             if not ok:
                 break
-            frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            if frame_idx < start:
+                frame_idx += 1
+                continue
+            if stop_i is not None and frame_idx >= stop_i:
+                break
+            if ((frame_idx - start) % step) == 0:
+                frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            frame_idx += 1
+    finally:
         cap.release()
-        if not frames:
-            raise RuntimeError(f"Empty video read: {path}")
-        vid = torch.from_numpy(np.stack(frames, axis=0))
-    if vid.numel() == 0:
-        raise RuntimeError(f"Empty video read: {path}")
-    return vid
+
+    if not frames:
+        raise RuntimeError(
+            f"Empty video read after slice start={start} stop={stop} step={step}: {path}"
+        )
+    return torch.from_numpy(np.stack(frames, axis=0))
 
 
 class STIRTracking(Dataset):
@@ -134,12 +147,10 @@ class STIRTracking(Dataset):
             if vis:
                 self._video_path = vis[0]
 
-        vid = _read_mp4_rgb_uint8(self._video_path)  # [T0, H0, W0, C] uint8
-        vid = vid.permute(0, 3, 1, 2).float() / 255.0  # [T0, 3, H0, W0]
-        T0 = vid.shape[0]
-        s0, s1 = self.start, T0 if stop is None else min(int(stop), T0)
-        idx = torch.arange(s0, s1, self.step, dtype=torch.long)
-        self._frames = vid.index_select(0, idx).contiguous()  # [T, 3, H0, W0]
+        vid = _read_mp4_rgb_uint8(
+            self._video_path, start=self.start, stop=stop, step=self.step,
+        )  # [T, H0, W0, C] uint8
+        self._frames = vid.permute(0, 3, 1, 2).float().contiguous() / 255.0  # [T, 3, H0, W0]
         self._h0, self._w0 = int(self._frames.shape[2]), int(self._frames.shape[3])
         self._needs_resize = (self._h0 != self.height) or (self._w0 != self.width)
 

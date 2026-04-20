@@ -72,8 +72,9 @@ def occlusion_accuracy(
     gt_vis: torch.Tensor,
 ) -> float:
     """Binary classification accuracy of visibility predictions vs GT."""
+    device = pred_vis.device
     pred_bool = pred_vis.bool()
-    gt_bool = gt_vis.bool()
+    gt_bool = gt_vis.to(device).bool()
     return float((pred_bool == gt_bool).float().mean())
 
 
@@ -196,6 +197,10 @@ def compute_tap_metrics(
     Returns:
         Dict with keys ``delta_avg``, ``OA``, ``AJ``.
     """
+    device, dtype = pred.device, pred.dtype
+    gt = gt.to(device=device, dtype=dtype)
+    gt_vis = gt_vis.to(device=device)
+    pred_vis = pred_vis.to(device=device)
     return {
         "delta_avg": delta_avg(pred, gt, gt_vis, thresholds),
         "OA": occlusion_accuracy(pred_vis, gt_vis),

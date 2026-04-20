@@ -361,6 +361,8 @@ parameters:
     value: True
   TRACKING_STEREOMIS_VAL_MAX_FRAMES:
     value: null
+  TRACKING_STEREOMIS_TEST_MAX_FRAMES:
+    value: null
   TRACKING_STEREOMIS_VAL_GRID:
     value: 20
   TRACKING_VAL_VIDEO_SEED:
@@ -369,6 +371,8 @@ parameters:
     value: False
   TRACKING_STIR_VAL:
     value: True
+  TRACKING_STIR_TEST_MAX_FRAMES:
+    value: null
   # One forced novel-view pseudo clip + sparse GT vs pred video (main rank only).
   TRACKING_VAL_PSEUDO_NOVELVIEW:
     value: True

@@ -281,12 +281,12 @@ parameters:
   # sliding windows anchored to the **original** query descriptor, so test-
   # time horizon is not bounded by ``TRACKING_SEQUENCE_LENGTH``.
   TRACKING_BATCH_SIZE:
-    value: 16
+    value: 4
   # Longer train-time window (was 32) → more supervision for long-horizon
   # drift; combined with chained super-windows (``PSEUDO_GT_LONG_LENGTH``)
   # this gives direct supervision up to ~2-3 x this value per batch.
   TRACKING_SEQUENCE_LENGTH:
-    value: 48
+    value: 32
   TRACKING_NUM_QUERY_POINTS:
     value: 128
   TRACKING_WORKERS:
@@ -413,6 +413,8 @@ parameters:
     value: True
   TRACKING_STEREOMIS_VAL_MAX_FRAMES:
     value: null
+  TRACKING_STEREOMIS_TEST_MAX_FRAMES:
+    value: null
   TRACKING_STEREOMIS_VAL_GRID:
     value: 20
   TRACKING_VAL_VIDEO_SEED:
@@ -421,6 +423,8 @@ parameters:
     value: False
   TRACKING_STIR_VAL:
     value: True
+  TRACKING_STIR_TEST_MAX_FRAMES:
+    value: null
   # One forced novel-view pseudo clip + sparse GT vs pred video (main rank only).
   TRACKING_VAL_PSEUDO_NOVELVIEW:
     value: True

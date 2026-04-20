@@ -1291,6 +1291,40 @@ class Engine:
         video_payload: Dict[str, Any] = {}
         rng = random.Random(int(self.config.get("TRACKING_VAL_VIDEO_SEED", 0)))
 
+        def _log_video_now(key: str, path: Optional[str], fps: int, caption: str) -> None:
+            """Log one W&B video immediately to avoid payload memory spikes."""
+            if self.wandb is None or not path or not os.path.isfile(path):
+                return
+            try:
+                payload = {
+                    key: wandb.Video(path, fps=max(int(fps), 4), format="mp4", caption=caption),
+                }
+                payload.update(self._wandb_test_eval_step_dict())
+                self.wandb.log(payload)
+            except Exception as e:
+                self.logger.info(f"  Video log failed ({key}): {e}", context="TEST")
+        few_use, few_frames, _ = self._tracking_val_fewframes_caps()
+
+        stereomis_stop: Optional[int] = few_frames if few_use else None
+        sm_test_cap = self.config.get("TRACKING_STEREOMIS_TEST_MAX_FRAMES", None)
+        if sm_test_cap is not None and sm_test_cap != "":
+            try:
+                sm_test_cap_i = int(sm_test_cap)
+                if sm_test_cap_i > 1:
+                    stereomis_stop = sm_test_cap_i
+            except Exception:
+                pass
+
+        stir_stop: Optional[int] = few_frames if few_use else None
+        stir_test_cap = self.config.get("TRACKING_STIR_TEST_MAX_FRAMES", None)
+        if stir_test_cap is not None and stir_test_cap != "":
+            try:
+                stir_test_cap_i = int(stir_test_cap)
+                if stir_test_cap_i > 1:
+                    stir_stop = stir_test_cap_i
+            except Exception:
+                pass
+
         stereomis_sequences: List[str] = []
         stereomis_root = ""
         stereomis_fps = 4
@@ -1322,6 +1356,11 @@ class Engine:
                     f"(windowed={use_windowed}, grid={grid_size}x{grid_size})",
                     context="TEST",
                 )
+            if stereomis_stop is not None:
+                self.logger.info(
+                    f"  STEREOMIS test frame cap: stop={stereomis_stop}",
+                    context="TEST",
+                )
 
         stereomis_video_seq = (
             rng.choice(stereomis_sequences) if stereomis_sequences else None
@@ -1335,6 +1374,9 @@ class Engine:
                     sequence=seq_name,
                     height=height,
                     width=width,
+                    start=0,
+                    stop=stereomis_stop,
+                    step=1,
                 )
             except (FileNotFoundError, RuntimeError) as e:
                 self.logger.info(
@@ -1414,8 +1456,10 @@ class Engine:
                     and video_path is not None
                     and os.path.isfile(video_path)
                 ):
-                    video_payload["Test/tracking/eval/stereomis/dense_video"] = wandb.Video(
-                        video_path, fps=max(stereomis_fps, 4), format="mp4",
+                    _log_video_now(
+                        key="Test/tracking/eval/stereomis/dense_video",
+                        path=video_path,
+                        fps=stereomis_fps,
                         caption=seq_name,
                     )
             else:
@@ -1523,11 +1567,11 @@ class Engine:
                         and cmp_video_path is not None
                         and os.path.isfile(cmp_video_path)
                     ):
-                        video_payload[
-                            "Test/tracking/eval/stereomis/gt_vs_pred_video"
-                        ] = wandb.Video(
-                            cmp_video_path, fps=max(stereomis_fps, 4),
-                            format="mp4", caption=seq_name,
+                        _log_video_now(
+                            key="Test/tracking/eval/stereomis/gt_vs_pred_video",
+                            path=cmp_video_path,
+                            fps=stereomis_fps,
+                            caption=seq_name,
                         )
             else:
                 self.logger.info(
@@ -1569,6 +1613,11 @@ class Engine:
                     f"(camera={camera}, grid={grid_size}x{grid_size})",
                     context="TEST",
                 )
+            if stir_stop is not None:
+                self.logger.info(
+                    f"  STIR test frame cap: stop={stir_stop}",
+                    context="TEST",
+                )
             stir_video_seq = rng.choice(stir_sequences) if stir_sequences else None
             for seq_name in stir_sequences:
                 self.logger.info(f"  STIR sequence: {seq_name}", context="TEST")
@@ -1578,6 +1627,9 @@ class Engine:
                         sequence=seq_name,
                         height=height,
                         width=width,
+                        start=0,
+                        stop=stir_stop,
+                        step=1,
                     )
                 except (FileNotFoundError, RuntimeError, OSError) as e:
                     self.logger.info(f"  Skipping STIR {seq_name}: {e}", context="TEST")
@@ -1697,8 +1749,11 @@ class Engine:
                         )
                         video_path = None
                     if self.wandb is not None and video_path and os.path.isfile(video_path):
-                        video_payload["Test/tracking/eval/stir/dense_video"] = wandb.Video(
-                            video_path, fps=max(stir_fps, 4), format="mp4", caption=seq_name,
+                        _log_video_now(
+                            key="Test/tracking/eval/stir/dense_video",
+                            path=video_path,
+                            fps=stir_fps,
+                            caption=seq_name,
                         )
 
                     if pred_tracks_gt is not None:
@@ -1755,11 +1810,11 @@ class Engine:
                             and cmp_video_path is not None
                             and os.path.isfile(cmp_video_path)
                         ):
-                            video_payload[
-                                "Test/tracking/eval/stir/gt_vs_pred_video"
-                            ] = wandb.Video(
-                                cmp_video_path, fps=max(stir_fps, 4),
-                                format="mp4", caption=seq_name,
+                            _log_video_now(
+                                key="Test/tracking/eval/stir/gt_vs_pred_video",
+                                path=cmp_video_path,
+                                fps=stir_fps,
+                                caption=seq_name,
                             )
 
                 all_sequence_metrics.append(seq_stir_metrics)
@@ -1802,7 +1857,7 @@ class Engine:
             summary_payload[f"{prefix_st}/median_dist_px_mean"] = float(np.nanmean(med_d))
             summary_payload[f"{prefix_st}/num_sequences"] = int(len(stir_rows))
             for j, th in enumerate(STIR_THRESHOLDS_PX):
-                vals = [r[7 + j] for r in stir_rows]
+                vals = [r[6 + j] for r in stir_rows]
                 summary_payload[f"{prefix_st}/acc_{int(th)}px_mean"] = float(np.nanmean(vals))
             self.logger.info(
                 f">> STIR test ({len(stir_rows)} seqs): "
@@ -3382,7 +3437,7 @@ class Engine:
         mean_dist_vals = [r[4] for r in per_seq_rows]
         median_dist_vals = [r[5] for r in per_seq_rows]
         threshold_acc = {
-            int(th): [r[7 + j] for r in per_seq_rows]
+            int(th): [r[6 + j] for r in per_seq_rows]
             for j, th in enumerate(STIR_THRESHOLDS_PX)
         }
         agg_payload: Dict[str, Any] = {
