@@ -16,6 +16,9 @@ from typing import Dict
 
 _DEFAULT_THRESHOLDS = (1.0, 2.0, 4.0, 8.0, 16.0)
 
+# STIR Challenge 2D accuracy thresholds (pixels, native 1280x1024 grid).
+STIR_THRESHOLDS_PX = (4.0, 8.0, 16.0, 32.0, 64.0)
+
 
 def position_accuracy(
     pred: torch.Tensor,
@@ -107,6 +110,70 @@ def average_jaccard(
 
     jaccard = tp / (tp + fp + fn).clamp_min(1.0)  # [Θ]
     return float(jaccard.mean())
+
+
+def compute_stir_endpoint_metrics(
+    pred_end: torch.Tensor,
+    gt_end: torch.Tensor,
+    thresholds: tuple[float, ...] = STIR_THRESHOLDS_PX,
+) -> Dict[str, float]:
+    r"""STIR Challenge 2D accuracy (unidirectional nearest-neighbour).
+
+    For every predicted endpoint we take the distance to the *nearest* GT end
+    center (unmatched sets) and report the fraction of predictions that fall
+    below each threshold plus their mean:
+
+    .. math::
+        d_i = \min_{j} \| \hat{p}_i - g_j \|_2, \qquad
+        \delta^{\theta} = \frac{1}{N}\sum_{i} \mathbf{1}[d_i < \theta], \qquad
+        \delta_{\text{avg}} = \frac{1}{|\Theta|}\sum_{\theta \in \Theta}\delta^{\theta}.
+
+    Both ``pred_end`` and ``gt_end`` must live in the **same pixel grid** (the
+    STIR thresholds ``(4, 8, 16, 32, 64)`` are defined in the native
+    1280x1024 segmentation grid).
+
+    Args:
+        pred_end: ``[N, 2]`` predicted endpoints.
+        gt_end:   ``[M, 2]`` GT tattoo centers at the last frame.
+        thresholds: pixel thresholds for accuracy.
+
+    Returns:
+        Dict with ``delta_avg``, ``mean_dist_px``, ``median_dist_px``,
+        ``num_query_points``, ``num_gt_points``, and per-threshold
+        ``acc_<th>px`` entries.
+    """
+    if pred_end.ndim != 2 or pred_end.shape[-1] != 2:
+        raise ValueError(f"pred_end must be [N, 2], got {tuple(pred_end.shape)}")
+    if gt_end.ndim != 2 or gt_end.shape[-1] != 2:
+        raise ValueError(f"gt_end must be [M, 2], got {tuple(gt_end.shape)}")
+
+    n = int(pred_end.shape[0])
+    m = int(gt_end.shape[0])
+    out: Dict[str, float] = {
+        "num_query_points": float(n),
+        "num_gt_points": float(m),
+    }
+    if n == 0 or m == 0:
+        out["delta_avg"] = float("nan")
+        out["mean_dist_px"] = float("nan")
+        out["median_dist_px"] = float("nan")
+        for th in thresholds:
+            out[f"acc_{int(th)}px"] = float("nan")
+        return out
+
+    pred = pred_end.detach().float()  # [N, 2]
+    gt = gt_end.detach().float().to(pred.device)  # [M, 2]
+    d_nn = torch.cdist(pred.unsqueeze(0), gt.unsqueeze(0)).squeeze(0).min(dim=1).values  # [N]
+
+    th_t = torch.tensor(thresholds, dtype=pred.dtype, device=pred.device)  # [Θ]
+    accs = (d_nn.unsqueeze(-1) < th_t.view(1, -1)).float().mean(dim=0)  # [Θ]
+
+    out["delta_avg"] = float(accs.mean())
+    out["mean_dist_px"] = float(d_nn.mean())
+    out["median_dist_px"] = float(d_nn.median())
+    for th, a in zip(thresholds, accs.tolist()):
+        out[f"acc_{int(th)}px"] = float(a)
+    return out
 
 
 def compute_tap_metrics(

@@ -1222,10 +1222,15 @@ class Engine:
         Logs under ``Test/tracking/eval/stereomis_annotated/...`` and
         ``Test/tracking/eval/stir/...``.
         """
+        import random
         from dataset.loader_phase import merge_phase_video_list
         from dataset.utils import select_videos_by_patterns
         from gatetracker.data import STIRTracking, StereoMISTracking
-        from gatetracker.tracking.metrics import compute_tap_metrics
+        from gatetracker.tracking.metrics import (
+            STIR_THRESHOLDS_PX,
+            compute_stir_endpoint_metrics,
+            compute_tap_metrics,
+        )
         from gatetracker.utils.visualization import (
             infer_tracks,
             infer_tracks_windowed,
@@ -1259,7 +1264,14 @@ class Engine:
             self.temporal_tracker.refinement_net.eval()
             self.logger.info("Using TemporalTracker for evaluation", context="TEST")
 
+        # Aggregated state: per-dataset lists of per-sequence metrics and
+        # one (``dense`` + ``gt_vs_pred``) video slot logged against stable
+        # W&B keys so repeated ``run_tests`` calls append to the same panel.
         all_sequence_metrics: List[Dict[str, Any]] = []
+        stereomis_rows: List[List[Any]] = []
+        stir_rows: List[List[Any]] = []
+        video_payload: Dict[str, Any] = {}
+        rng = random.Random(int(self.config.get("TRACKING_VAL_VIDEO_SEED", 0)))
 
         stereomis_sequences: List[str] = []
         stereomis_root = ""
@@ -1293,6 +1305,9 @@ class Engine:
                     context="TEST",
                 )
 
+        stereomis_video_seq = (
+            rng.choice(stereomis_sequences) if stereomis_sequences else None
+        )
         for seq_name in stereomis_sequences:
             self.logger.info(f"  Tracking sequence: {seq_name}", context="TEST")
 
@@ -1348,40 +1363,38 @@ class Engine:
                 )  # [T, N, 2]
 
             safe_tag = str(seq_name).replace("/", "_").replace(os.sep, "_")
+            is_chosen_video = seq_name == stereomis_video_seq
             video_path = os.path.join(tracking_dir, f"{safe_tag}_stereomis_tracking.mp4")
-            try:
-                render_tracks_video(
-                    dataset=ds,
-                    trajectories=trajectories,
-                    output_path=video_path,
-                    fps=max(stereomis_fps, 4),
-                    trail_length=max(5, stereomis_fps),
-                    point_radius=3,
-                )
-                self.logger.info(
-                    f"  Saved tracking video: {video_path}", context="TEST"
-                )
-            except RuntimeError as e:
-                self.logger.info(
-                    f"  Video render failed for {seq_name}: {e}", context="TEST"
-                )
-                video_path = None
-
-            if self.wandb is not None and video_path is not None and os.path.isfile(video_path):
+            if is_chosen_video:
                 try:
-                    self.wandb.log(
-                        {
-                            f"Test/tracking/eval/stereomis_annotated/{safe_tag}/dense_video": wandb.Video(
-                                video_path, fps=max(stereomis_fps, 4), format="mp4"
-                            ),
-                            **self._wandb_test_eval_step_dict(),
-                        }
+                    render_tracks_video(
+                        dataset=ds,
+                        trajectories=trajectories,
+                        output_path=video_path,
+                        fps=max(stereomis_fps, 4),
+                        trail_length=max(5, stereomis_fps),
+                        point_radius=3,
                     )
-                except Exception as e:
                     self.logger.info(
-                        f"  wandb.Video upload failed for {seq_name}: {e}",
-                        context="TEST",
+                        f"  Saved tracking video: {video_path}", context="TEST",
                     )
+                except RuntimeError as e:
+                    self.logger.info(
+                        f"  Video render failed for {seq_name}: {e}", context="TEST",
+                    )
+                    video_path = None
+
+                if (
+                    self.wandb is not None
+                    and video_path is not None
+                    and os.path.isfile(video_path)
+                ):
+                    video_payload["Test/tracking/eval/stereomis/dense_video"] = wandb.Video(
+                        video_path, fps=max(stereomis_fps, 4), format="mp4",
+                        caption=seq_name,
+                    )
+            else:
+                video_path = None
 
             seq_metrics = {"sequence": seq_name, "dataset": "STEREOMIS"}
             if ds.tracking_points is not None:
@@ -1427,6 +1440,14 @@ class Engine:
                     pred_tracks, gt_tracks, gt_vis, pred_vis
                 )
                 seq_metrics.update(results)
+                stereomis_rows.append([
+                    seq_name,
+                    int(gt_tracks.shape[0]),
+                    int(gt_tracks.shape[1]),
+                    float(results["delta_avg"]),
+                    float(results["OA"]),
+                    float(results["AJ"]),
+                ])
 
                 self.logger.info(
                     f"  {seq_name}: delta_avg={results['delta_avg']:.4f}  "
@@ -1434,69 +1455,50 @@ class Engine:
                     context="TEST",
                 )
 
-                if self.wandb is not None:
-                    self.wandb.log(
-                        {
-                            f"Test/tracking/eval/stereomis_annotated/{safe_tag}/delta_avg": results["delta_avg"],
-                            f"Test/tracking/eval/stereomis_annotated/{safe_tag}/OA": results["OA"],
-                            f"Test/tracking/eval/stereomis_annotated/{safe_tag}/AJ": results["AJ"],
-                            **self._wandb_test_eval_step_dict(),
-                        }
+                if is_chosen_video:
+                    pixel_errors = (pred_tracks - gt_tracks).norm(dim=-1)  # [N_pts, T_pred]
+                    gt_traj_for_video = gt_tracks.permute(1, 0, 2)  # [T_pred, N_pts, 2]
+                    cmp_video_path = os.path.join(
+                        tracking_dir, f"{safe_tag}_stereomis_gt_vs_pred.mp4",
                     )
-
-                pixel_errors = (pred_tracks - gt_tracks).norm(dim=-1)  # [N_pts, T_pred]
-
-                gt_traj_for_video = gt_tracks.permute(1, 0, 2)  # [T_pred, N_pts, 2]
-                cmp_video_path = os.path.join(
-                    tracking_dir, f"{safe_tag}_stereomis_gt_vs_pred.mp4"
-                )
-                try:
-                    gate_pred = bool(self.config.get(
-                        "TRACKING_VAL_COMP_GATE_PREDVIS", False,
-                    ))
-                    render_comparison_video(
-                        dataset=ds,
-                        pred_trajectories=eval_traj,
-                        gt_trajectories=gt_traj_for_video,
-                        output_path=cmp_video_path,
-                        fps=max(stereomis_fps, 4),
-                        trail_length=max(5, stereomis_fps),
-                        point_radius=3,
-                        visibility=gt_vis,
-                        pred_visibility=(
-                            pred_vis if (has_temporal_tracker and gate_pred) else None
-                        ),
-                        errors=pixel_errors,
-                    )
-                    self.logger.info(
-                        f"  Saved GT-vs-pred comparison video: {cmp_video_path}",
-                        context="TEST",
-                    )
-                except RuntimeError as e:
-                    self.logger.info(
-                        f"  Comparison video render failed for {seq_name}: {e}",
-                        context="TEST",
-                    )
-                    cmp_video_path = None
-
-                if (
-                    self.wandb is not None
-                    and cmp_video_path is not None
-                    and os.path.isfile(cmp_video_path)
-                ):
                     try:
-                        self.wandb.log(
-                            {
-                                f"Test/tracking/eval/stereomis_annotated/{safe_tag}/gt_vs_pred_video": wandb.Video(
-                                    cmp_video_path, fps=max(stereomis_fps, 4), format="mp4"
-                                ),
-                                **self._wandb_test_eval_step_dict(),
-                            }
+                        gate_pred = bool(self.config.get(
+                            "TRACKING_VAL_COMP_GATE_PREDVIS", False,
+                        ))
+                        render_comparison_video(
+                            dataset=ds,
+                            pred_trajectories=eval_traj,
+                            gt_trajectories=gt_traj_for_video,
+                            output_path=cmp_video_path,
+                            fps=max(stereomis_fps, 4),
+                            trail_length=max(5, stereomis_fps),
+                            point_radius=3,
+                            visibility=gt_vis,
+                            pred_visibility=(
+                                pred_vis if (has_temporal_tracker and gate_pred) else None
+                            ),
+                            errors=pixel_errors,
                         )
-                    except Exception as e:
                         self.logger.info(
-                            f"  wandb.Video upload failed for comparison {seq_name}: {e}",
+                            f"  Saved GT-vs-pred comparison video: {cmp_video_path}",
                             context="TEST",
+                        )
+                    except RuntimeError as e:
+                        self.logger.info(
+                            f"  Comparison video render failed for {seq_name}: {e}",
+                            context="TEST",
+                        )
+                        cmp_video_path = None
+                    if (
+                        self.wandb is not None
+                        and cmp_video_path is not None
+                        and os.path.isfile(cmp_video_path)
+                    ):
+                        video_payload[
+                            "Test/tracking/eval/stereomis/gt_vs_pred_video"
+                        ] = wandb.Video(
+                            cmp_video_path, fps=max(stereomis_fps, 4),
+                            format="mp4", caption=seq_name,
                         )
             else:
                 self.logger.info(
@@ -1538,6 +1540,7 @@ class Engine:
                     f"(camera={camera}, grid={grid_size}x{grid_size})",
                     context="TEST",
                 )
+            stir_video_seq = rng.choice(stir_sequences) if stir_sequences else None
             for seq_name in stir_sequences:
                 self.logger.info(f"  STIR sequence: {seq_name}", context="TEST")
                 try:
@@ -1556,114 +1559,230 @@ class Engine:
                     )
                     continue
                 h, w = ds[0]["image"].shape[1:]
-                grid_pts = make_grid_points(h, w, grid_h=grid_size, grid_w=grid_size)
                 _cached_all_frames = None
                 if has_temporal_tracker:
                     _cached_all_frames = torch.stack(
                         [ds[t]["image"] for t in range(len(ds))], dim=0,
-                    ).unsqueeze(0).to(self.device)
-                if has_temporal_tracker:
+                    ).unsqueeze(0).to(self.device)  # [1, T, 3, H, W]
+
+                # --- GT-anchored tracking: start from the IR-tattoo centers ---
+                start_pts = ds.start_points  # [N_start, 2] in processing grid
+                end_pts_orig = ds.end_points_orig  # [N_end, 2] in native STIR grid
+                h_orig, w_orig = ds.orig_size
+
+                seq_stir_metrics: Dict[str, Any] = {
+                    "sequence": seq_name, "dataset": "STIR",
+                }
+                pred_tracks_gt: Optional[torch.Tensor] = None
+                if has_temporal_tracker and start_pts.numel() > 0 and end_pts_orig.numel() > 0:
                     with torch.no_grad():
-                        tracker_out = self.temporal_tracker.track_long_sequence(
-                            grid_pts.unsqueeze(0).to(self.device),
+                        gt_tracker_out = self.temporal_tracker.track_long_sequence(
+                            start_pts.unsqueeze(0).to(self.device),
                             _cached_all_frames,
                             window_size=window_size,
                             **self._track_long_sequence_infer_kwargs(),
                         )
-                    trajectories = tracker_out["tracks"].squeeze(0).permute(1, 0, 2).cpu()
-                elif use_windowed:
-                    trajectories = infer_tracks_windowed(
-                        dataset=ds,
-                        matching_pipeline=self.matcher,
-                        initial_points=grid_pts,
-                        window_size=window_size,
+                    pred_tracks_gt = gt_tracker_out["tracks"].squeeze(0)  # [N_start, T, 2]
+                    sx = float(w_orig) / max(float(width), 1.0)
+                    sy = float(h_orig) / max(float(height), 1.0)
+                    pred_end_orig = pred_tracks_gt[:, -1, :].clone()
+                    pred_end_orig[..., 0] *= sx
+                    pred_end_orig[..., 1] *= sy
+                    metric = compute_stir_endpoint_metrics(
+                        pred_end_orig.cpu(), end_pts_orig,
+                        thresholds=STIR_THRESHOLDS_PX,
                     )
-                else:
-                    trajectories = infer_tracks(
-                        dataset=ds,
-                        matching_pipeline=self.matcher,
-                        initial_points=grid_pts,
-                    )
-                safe_tag = str(seq_name).replace("/", "_").replace(os.sep, "_")
-                video_path = os.path.join(tracking_dir, f"{safe_tag}_stir_tracking.mp4")
-                try:
-                    render_tracks_video(
-                        dataset=ds,
-                        trajectories=trajectories,
-                        output_path=video_path,
-                        fps=max(stir_fps, 4),
-                        trail_length=max(5, stir_fps),
-                        point_radius=3,
-                    )
-                except RuntimeError as e:
+                    stir_rows.append([
+                        seq_name,
+                        int(metric["num_query_points"]),
+                        int(metric["num_gt_points"]),
+                        float(metric["delta_avg"]),
+                        float(metric["mean_dist_px"]),
+                        float(metric["median_dist_px"]),
+                        *[float(metric[f"acc_{int(th)}px"]) for th in STIR_THRESHOLDS_PX],
+                    ])
+                    seq_stir_metrics.update({
+                        k: v for k, v in metric.items()
+                        if isinstance(v, float) or isinstance(v, int)
+                    })
                     self.logger.info(
-                        f"  STIR video render failed for {seq_name}: {e}", context="TEST"
+                        f"  {seq_name}: STIR δavg={metric['delta_avg']:.4f} "
+                        f"mean={metric['mean_dist_px']:.2f}px "
+                        f"N={int(metric['num_query_points'])}",
+                        context="TEST",
                     )
-                    video_path = None
-                if self.wandb is not None and video_path and os.path.isfile(video_path):
+
+                # --- Videos (only for the chosen sequence) ---
+                is_chosen_video = seq_name == stir_video_seq
+                if is_chosen_video:
+                    grid_pts = make_grid_points(h, w, grid_h=grid_size, grid_w=grid_size)
+                    if has_temporal_tracker:
+                        with torch.no_grad():
+                            tracker_out = self.temporal_tracker.track_long_sequence(
+                                grid_pts.unsqueeze(0).to(self.device),
+                                _cached_all_frames,
+                                window_size=window_size,
+                                **self._track_long_sequence_infer_kwargs(),
+                            )
+                        trajectories = tracker_out["tracks"].squeeze(0).permute(1, 0, 2).cpu()
+                    elif use_windowed:
+                        trajectories = infer_tracks_windowed(
+                            dataset=ds,
+                            matching_pipeline=self.matcher,
+                            initial_points=grid_pts,
+                            window_size=window_size,
+                        )
+                    else:
+                        trajectories = infer_tracks(
+                            dataset=ds,
+                            matching_pipeline=self.matcher,
+                            initial_points=grid_pts,
+                        )
+                    safe_tag = str(seq_name).replace("/", "_").replace(os.sep, "_")
+                    video_path = os.path.join(tracking_dir, f"{safe_tag}_stir_tracking.mp4")
                     try:
-                        self.wandb.log(
-                            {
-                                f"Test/tracking/eval/stir/{safe_tag}/dense_video": wandb.Video(
-                                    video_path, fps=max(stir_fps, 4), format="mp4"
-                                ),
-                                **self._wandb_test_eval_step_dict(),
-                            }
+                        render_tracks_video(
+                            dataset=ds,
+                            trajectories=trajectories,
+                            output_path=video_path,
+                            fps=max(stir_fps, 4),
+                            trail_length=max(5, stir_fps),
+                            point_radius=3,
                         )
-                    except Exception as e:
+                    except RuntimeError as e:
                         self.logger.info(
-                            f"  STIR wandb.Video failed for {seq_name}: {e}", context="TEST"
+                            f"  STIR video render failed for {seq_name}: {e}", context="TEST",
                         )
-                all_sequence_metrics.append({"sequence": seq_name, "dataset": "STIR"})
-                del ds, trajectories
+                        video_path = None
+                    if self.wandb is not None and video_path and os.path.isfile(video_path):
+                        video_payload["Test/tracking/eval/stir/dense_video"] = wandb.Video(
+                            video_path, fps=max(stir_fps, 4), format="mp4", caption=seq_name,
+                        )
+
+                    if pred_tracks_gt is not None:
+                        T_total = int(pred_tracks_gt.shape[1])
+                        end_pts_proc = ds.end_points.to(pred_tracks_gt.device)
+                        if end_pts_proc.numel() > 0:
+                            pred_end_proc = pred_tracks_gt[:, -1, :]
+                            dmat = torch.cdist(
+                                pred_end_proc.unsqueeze(0),
+                                end_pts_proc.unsqueeze(0),
+                            ).squeeze(0)
+                            matched_end = end_pts_proc[dmat.argmin(dim=1)]
+                        else:
+                            matched_end = pred_tracks_gt[:, -1, :].clone()
+                        alpha = torch.linspace(
+                            0.0, 1.0, T_total, device=pred_tracks_gt.device,
+                        ).view(1, T_total, 1)
+                        gt_traj_proc = (1.0 - alpha) * start_pts.to(
+                            pred_tracks_gt.device
+                        ).unsqueeze(1) + alpha * matched_end.unsqueeze(1)
+                        gt_vis = torch.zeros(
+                            pred_tracks_gt.shape[0], T_total, dtype=torch.bool,
+                        )
+                        gt_vis[:, 0] = True
+                        gt_vis[:, -1] = True
+                        pred_errors = (
+                            pred_tracks_gt.cpu() - gt_traj_proc.cpu()
+                        ).norm(dim=-1)
+                        cmp_video_path = os.path.join(
+                            tracking_dir, f"{safe_tag}_stir_gt_vs_pred.mp4",
+                        )
+                        try:
+                            render_comparison_video(
+                                dataset=ds,
+                                pred_trajectories=pred_tracks_gt.permute(1, 0, 2).cpu(),
+                                gt_trajectories=gt_traj_proc.permute(1, 0, 2).cpu(),
+                                output_path=cmp_video_path,
+                                fps=max(stir_fps, 4),
+                                trail_length=max(5, stir_fps),
+                                point_radius=3,
+                                visibility=gt_vis,
+                                errors=pred_errors,
+                                gate_prediction_on_gt_vis=False,
+                            )
+                        except RuntimeError as e:
+                            self.logger.info(
+                                f"  STIR comparison video render failed for {seq_name}: {e}",
+                                context="TEST",
+                            )
+                            cmp_video_path = None
+                        if (
+                            self.wandb is not None
+                            and cmp_video_path is not None
+                            and os.path.isfile(cmp_video_path)
+                        ):
+                            video_payload[
+                                "Test/tracking/eval/stir/gt_vs_pred_video"
+                            ] = wandb.Video(
+                                cmp_video_path, fps=max(stir_fps, 4),
+                                format="mp4", caption=seq_name,
+                            )
+
+                all_sequence_metrics.append(seq_stir_metrics)
+                del ds
                 if _cached_all_frames is not None:
                     del _cached_all_frames
                 torch.cuda.empty_cache()
 
-        seqs_with_metrics = [
-            m for m in all_sequence_metrics if "delta_avg" in m
-        ]
-        if seqs_with_metrics:
-            mean_delta = np.mean([m["delta_avg"] for m in seqs_with_metrics])
-            mean_oa = np.mean([m["OA"] for m in seqs_with_metrics])
-            mean_aj = np.mean([m["AJ"] for m in seqs_with_metrics])
-
+        # ------ Aggregate, log once with stable per-dataset keys ------
+        summary_payload: Dict[str, Any] = dict(video_payload)
+        if stereomis_rows:
+            delta = [r[3] for r in stereomis_rows]
+            oa = [r[4] for r in stereomis_rows]
+            aj = [r[5] for r in stereomis_rows]
+            prefix_sm = "Test/tracking/eval/stereomis"
+            summary_payload[f"{prefix_sm}/delta_avg_mean"] = float(np.nanmean(delta))
+            summary_payload[f"{prefix_sm}/OA_mean"] = float(np.nanmean(oa))
+            summary_payload[f"{prefix_sm}/AJ_mean"] = float(np.nanmean(aj))
+            summary_payload[f"{prefix_sm}/num_sequences"] = int(len(stereomis_rows))
             self.logger.info(
-                f">> TRACKING MEAN ({len(seqs_with_metrics)} seqs w/ GT): "
-                f"delta_avg={mean_delta:.4f}  OA={mean_oa:.4f}  AJ={mean_aj:.4f}",
+                f">> STEREOMIS test ({len(stereomis_rows)} seqs): "
+                f"δavg={summary_payload[f'{prefix_sm}/delta_avg_mean']:.4f} "
+                f"OA={summary_payload[f'{prefix_sm}/OA_mean']:.4f} "
+                f"AJ={summary_payload[f'{prefix_sm}/AJ_mean']:.4f}",
                 context="TEST",
             )
-
             if self.wandb is not None:
-                self.wandb.log(
-                    {
-                        "Test/tracking/eval/stereomis_annotated/mean_delta_avg": mean_delta,
-                        "Test/tracking/eval/stereomis_annotated/mean_OA": mean_oa,
-                        "Test/tracking/eval/stereomis_annotated/mean_AJ": mean_aj,
-                        **self._wandb_test_eval_step_dict(),
-                    }
+                summary_payload[f"{prefix_sm}/per_sequence"] = wandb.Table(
+                    columns=["sequence", "num_points", "num_frames", "delta_avg", "OA", "AJ"],
+                    data=stereomis_rows,
                 )
 
-                tracking_table = wandb.Table(
-                    columns=["dataset", "sequence", "delta_avg", "OA", "AJ"],
-                    data=[
-                        [
-                            m.get("dataset", "STEREOMIS"),
-                            m["sequence"],
-                            m["delta_avg"],
-                            m["OA"],
-                            m["AJ"],
-                        ]
-                        for m in seqs_with_metrics
+        if stir_rows:
+            prefix_st = "Test/tracking/eval/stir"
+            delta = [r[3] for r in stir_rows]
+            mean_d = [r[4] for r in stir_rows]
+            med_d = [r[5] for r in stir_rows]
+            summary_payload[f"{prefix_st}/delta_avg_mean"] = float(np.nanmean(delta))
+            summary_payload[f"{prefix_st}/mean_dist_px_mean"] = float(np.nanmean(mean_d))
+            summary_payload[f"{prefix_st}/median_dist_px_mean"] = float(np.nanmean(med_d))
+            summary_payload[f"{prefix_st}/num_sequences"] = int(len(stir_rows))
+            for j, th in enumerate(STIR_THRESHOLDS_PX):
+                vals = [r[7 + j] for r in stir_rows]
+                summary_payload[f"{prefix_st}/acc_{int(th)}px_mean"] = float(np.nanmean(vals))
+            self.logger.info(
+                f">> STIR test ({len(stir_rows)} seqs): "
+                f"δavg={summary_payload[f'{prefix_st}/delta_avg_mean']:.4f} "
+                f"mean_dist={summary_payload[f'{prefix_st}/mean_dist_px_mean']:.2f}px",
+                context="TEST",
+            )
+            if self.wandb is not None:
+                summary_payload[f"{prefix_st}/per_sequence"] = wandb.Table(
+                    columns=[
+                        "sequence", "num_query", "num_gt",
+                        "delta_avg", "mean_dist_px", "median_dist_px",
+                        *[f"acc_{int(th)}px" for th in STIR_THRESHOLDS_PX],
                     ],
+                    data=stir_rows,
                 )
-                self.wandb.log(
-                    {
-                        "Test/tracking/eval/summary/metrics_table": tracking_table,
-                        **self._wandb_test_eval_step_dict(),
-                    }
-                )
-                del tracking_table
+
+        if self.wandb is not None and summary_payload:
+            try:
+                summary_payload.update(self._wandb_test_eval_step_dict())
+                self.wandb.log(summary_payload)
+            except Exception as e:
+                self.logger.info(f"  Test-tracking wandb summary log failed: {e}", context="TEST")
 
         if all_sequence_metrics:
             tracking_csv_path = os.path.join(tracking_dir, "tracking_metrics.csv")
@@ -2684,6 +2803,13 @@ class Engine:
         self._tracking_validate_pseudo_novelview(epoch)
 
     def _stereomis_validation_epoch(self, epoch: int) -> None:
+        """StereoMIS val: aggregated TAP metrics + one comparison video.
+
+        All W&B logs use **stable keys** (``Validation/tracking/eval/stereomis/...``)
+        with no sequence name inside the key, so each epoch appends to the same
+        panel at ``step/epoch``. Per-sequence metrics are emitted as a
+        ``wandb.Table`` (one row per clip) once per epoch.
+        """
         if not bool(self.config.get("TRACKING_STEREOMIS_VAL", True)):
             return
         import random
@@ -2739,7 +2865,7 @@ class Engine:
         grid_size = int(self.config.get("TRACKING_STEREOMIS_VAL_GRID", 10))
         out_dir = os.path.join(self.RUN_DIR, "tracking_val")
         os.makedirs(out_dir, exist_ok=True)
-        prefix = "Validation/tracking/eval/stereomis_annotated"
+        prefix = "Validation/tracking/eval/stereomis"
         render_all = bool(self.config.get("TRACKING_VAL_RENDER_VIDEOS_ALL_SEQS", False))
         rng = random.Random(int(self.config.get("TRACKING_VAL_VIDEO_SEED", 0)) + int(epoch))
 
@@ -2758,6 +2884,8 @@ class Engine:
         video_seq = rng.choice(eligible_names) if eligible_names else None
 
         self.temporal_tracker.eval()
+        per_seq_rows: List[List[Any]] = []
+        video_payload: Dict[str, Any] = {}
         for seq_name in val_seqs:
             safe = str(seq_name).replace("/", "_").replace(os.sep, "_")
             try:
@@ -2807,15 +2935,21 @@ class Engine:
             gt_vis = ds.visibility[:, :T_pred].to(pred_tracks.device)
             results = compute_tap_metrics(pred_tracks, gt_tracks, gt_vis, pred_vis)
 
-            log_payload: Dict[str, Any] = {
-                f"{prefix}/{safe}/delta_avg": results["delta_avg"],
-                f"{prefix}/{safe}/OA": results["OA"],
-                f"{prefix}/{safe}/AJ": results["AJ"],
-                **self._wandb_epoch_axis_dict(epoch),
-            }
+            per_seq_rows.append([
+                seq_name,
+                int(gt_tracks.shape[0]),
+                int(T_pred),
+                results["delta_avg"],
+                results["OA"],
+                results["AJ"],
+            ])
+            self.logger.info(
+                f"  StereoMIS {seq_name}: δavg={results['delta_avg']:.4f} "
+                f"OA={results['OA']:.4f} AJ={results['AJ']:.4f}",
+                context="TRACKING",
+            )
+
             do_video = render_all or (seq_name == video_seq)
-            grid_path: Optional[str] = None
-            cmp_path: Optional[str] = None
             if do_video:
                 grid_path = os.path.join(out_dir, f"stereomis_{safe}_grid_ep{epoch:04d}.mp4")
                 cmp_path = os.path.join(out_dir, f"stereomis_{safe}_cmp_ep{epoch:04d}.mp4")
@@ -2831,7 +2965,7 @@ class Engine:
                     pixel_errors = (pred_tracks.cpu() - gt_tracks.cpu()).norm(dim=-1)
                     gt_vid = gt_tracks.permute(1, 0, 2).cpu()
                     pred_vid = pred_tracks.permute(1, 0, 2).cpu()
-                    # At early training, the visibility head outputs logits ≈ 0
+                    # At early training the visibility head outputs logits ≈ 0
                     # → sigmoid(0) = 0.5 → ``pred_vis = False`` for every point,
                     # which would hide every predicted circle/trail. Gate on
                     # the predicted mask only when the user explicitly asks
@@ -2854,37 +2988,84 @@ class Engine:
                     )
                 except RuntimeError as e:
                     self.logger.warning(f"StereoMIS val video {seq_name}: {e}", context="TRACKING")
-                    grid_path, cmp_path = None, None
-                if self.wandb is not None:
-                    try:
-                        if grid_path and os.path.isfile(grid_path):
-                            log_payload[f"{prefix}/{safe}/dense_video"] = wandb.Video(
-                                grid_path, fps=max(fps, 4), format="mp4"
-                            )
-                        if cmp_path and os.path.isfile(cmp_path):
-                            log_payload[f"{prefix}/{safe}/gt_vs_pred_video"] = wandb.Video(
-                                cmp_path, fps=max(fps, 4), format="mp4"
-                            )
-                    except Exception as e:
-                        self.logger.warning(f"StereoMIS val wandb video: {e}", context="TRACKING")
-
-            if self.wandb is not None:
-                try:
-                    self.wandb.log(log_payload)
-                except Exception as e:
-                    self.logger.warning(f"StereoMIS val wandb log: {e}", context="TRACKING")
+                    grid_path = cmp_path = ""
+                caption = f"[ep {epoch}] {seq_name}"
+                if grid_path and os.path.isfile(grid_path):
+                    video_payload[f"{prefix}/dense_video"] = wandb.Video(
+                        grid_path, fps=max(fps, 4), format="mp4", caption=caption,
+                    )
+                if cmp_path and os.path.isfile(cmp_path):
+                    video_payload[f"{prefix}/gt_vs_pred_video"] = wandb.Video(
+                        cmp_path, fps=max(fps, 4), format="mp4", caption=caption,
+                    )
 
             del all_frames, grid_out, gt_out, ds
             torch.cuda.empty_cache()
 
+        if not per_seq_rows:
+            return
+
+        delta_vals = [r[3] for r in per_seq_rows]
+        oa_vals = [r[4] for r in per_seq_rows]
+        aj_vals = [r[5] for r in per_seq_rows]
+        agg_payload: Dict[str, Any] = {
+            f"{prefix}/delta_avg_mean": float(np.nanmean(delta_vals)),
+            f"{prefix}/OA_mean": float(np.nanmean(oa_vals)),
+            f"{prefix}/AJ_mean": float(np.nanmean(aj_vals)),
+            f"{prefix}/num_sequences": int(len(per_seq_rows)),
+            **self._wandb_epoch_axis_dict(epoch),
+        }
+        self.logger.info(
+            f">> StereoMIS val ({len(per_seq_rows)} seqs): "
+            f"δavg={agg_payload[f'{prefix}/delta_avg_mean']:.4f} "
+            f"OA={agg_payload[f'{prefix}/OA_mean']:.4f} "
+            f"AJ={agg_payload[f'{prefix}/AJ_mean']:.4f}",
+            context="TRACKING",
+        )
+        if self.wandb is not None:
+            try:
+                table = wandb.Table(
+                    columns=["sequence", "num_points", "num_frames", "delta_avg", "OA", "AJ"],
+                    data=per_seq_rows,
+                )
+                payload = {
+                    **agg_payload,
+                    **video_payload,
+                    f"{prefix}/per_sequence": table,
+                }
+                self.wandb.log(payload)
+            except Exception as e:
+                self.logger.warning(f"StereoMIS val wandb log: {e}", context="TRACKING")
+
     def _stir_validation_epoch(self, epoch: int) -> None:
+        """STIR val: endpoint accuracy on IR-tattoo GT + one tracked video.
+
+        Metrics are computed against the **IR-derived** ground truth provided by
+        the STIR Challenge: ``icgstartseg.png`` / ``icgendseg.png`` give two
+        sparse point sets (tattoo centers at the first and last frame of each
+        clip). We track the start centers through the clip with the temporal
+        tracker and score the predicted endpoint against the nearest GT end
+        center at native-resolution STIR thresholds ``(4, 8, 16, 32, 64)`` px.
+
+        All W&B entries use **stable keys** (no per-sequence namespace) so each
+        epoch logs onto the **same panel** at ``step/epoch`` rather than
+        creating a new panel per randomly-chosen sequence. A per-sequence
+        breakdown is logged once per epoch as a ``wandb.Table``.
+        """
         if not bool(self.config.get("TRACKING_STIR_VAL", True)):
             return
         import random
         from dataset.loader_phase import merge_phase_video_list
         from dataset.utils import select_videos_by_patterns
         from gatetracker.data import STIRTracking
-        from gatetracker.utils.visualization import make_grid_points, render_tracks_video
+        from gatetracker.tracking.metrics import (
+            STIR_THRESHOLDS_PX,
+            compute_stir_endpoint_metrics,
+        )
+        from gatetracker.utils.visualization import (
+            render_comparison_video,
+            render_tracks_video,
+        )
 
         datasets_config = self.config.get("DATASETS", {}) or {}
         stir_cfg = datasets_config.get("STIR", None)
@@ -2914,7 +3095,6 @@ class Engine:
                 self.config.get("TRACKING_WINDOW_SIZE", 16),
             )
         )
-        grid_size = int(self.config.get("TRACKING_STEREOMIS_VAL_GRID", 10))
         fps = int(stir_cfg.get("FPS", 8))
         out_dir = os.path.join(self.RUN_DIR, "tracking_val")
         os.makedirs(out_dir, exist_ok=True)
@@ -2923,103 +3103,188 @@ class Engine:
         video_seq = rng.choice(val_seqs) if val_seqs else None
 
         self.temporal_tracker.eval()
+        per_seq_rows: List[List[Any]] = []
+        video_payload: Dict[str, Any] = {}
         for seq_name in val_seqs:
-            if seq_name != video_seq:
-                continue
             safe = str(seq_name).replace("/", "_").replace(os.sep, "_")
             try:
                 ds = STIRTracking(root=root, sequence=seq_name, height=height, width=width)
             except (FileNotFoundError, RuntimeError, OSError) as e:
                 self.logger.warning(f"STIR val skip {seq_name}: {e}", context="TRACKING")
-                return
+                continue
             if len(ds) < 2:
-                return
-            h, w = ds[0]["image"].shape[1:]
-            grid_pts = make_grid_points(h, w, grid_h=grid_size, grid_w=grid_size)
+                continue
+
+            start_pts = ds.start_points  # [N_start, 2] in processing pixels
+            end_pts_orig = ds.end_points_orig  # [N_end, 2] in native pixels
+            h_orig, w_orig = ds.orig_size
+            if start_pts.numel() == 0 or end_pts_orig.numel() == 0:
+                self.logger.warning(
+                    f"STIR val {seq_name}: empty start/end segmentations", context="TRACKING",
+                )
+                continue
+
             all_frames = torch.stack(
                 [ds[t]["image"] for t in range(len(ds))], dim=0,
-            ).unsqueeze(0).to(self.device)
+            ).unsqueeze(0).to(self.device)  # [1, T, 3, H, W]
+            T_total = int(all_frames.shape[1])
+
             with torch.no_grad():
-                tr_out = self.temporal_tracker.track_long_sequence(
-                    grid_pts.unsqueeze(0).to(self.device),
+                gt_out = self.temporal_tracker.track_long_sequence(
+                    start_pts.unsqueeze(0).to(self.device),
                     all_frames,
                     window_size=window_size,
                     **self._track_long_sequence_infer_kwargs(),
                 )
+            pred_tracks = gt_out["tracks"].squeeze(0)  # [N_start, T, 2] in processing px
 
-                # STIR has no annotated GT tracks in our loader; emit
-                # self-supervised proxy scalars so each sequence produces
-                # comparable numbers across epochs (not just a video).
-                # fwd_tracks: [1, Q, T, 2]; vis_logits: [1, Q, T]
-                fwd_tracks = tr_out["tracks"]
-                fwd_vis_logit = tr_out["visibility"]
-                T_total = int(all_frames.shape[1])
-                # Reverse-pass from the last tracked position to get a cycle
-                # estimate without GT (re-uses the same track_long_sequence).
-                rev_query = fwd_tracks[:, :, -1, :].contiguous()
-                rev_frames = all_frames.flip(dims=[1])
-                rev_out = self.temporal_tracker.track_long_sequence(
-                    rev_query,
-                    rev_frames,
-                    window_size=window_size,
-                    **self._track_long_sequence_infer_kwargs(),
-                )
-                rev_tracks = rev_out["tracks"].flip(dims=[2])  # [1, Q, T, 2]
+            # Scale predicted endpoints back to native STIR resolution so the
+            # [4, 8, 16, 32, 64] px thresholds match the STIRMetrics protocol.
+            sx = float(w_orig) / max(float(width), 1.0)
+            sy = float(h_orig) / max(float(height), 1.0)
+            pred_endpoint_orig = pred_tracks[:, -1, :].clone()  # [N_start, 2]
+            pred_endpoint_orig[..., 0] *= sx
+            pred_endpoint_orig[..., 1] *= sy
+            metric = compute_stir_endpoint_metrics(
+                pred_endpoint_orig.cpu(), end_pts_orig, thresholds=STIR_THRESHOLDS_PX,
+            )
 
-                cycle_err = (
-                    (fwd_tracks[:, :, 0, :] - rev_tracks[:, :, 0, :])
-                    .norm(dim=-1)
-                    .mean()
-                )  # scalar
-                # Mean per-frame displacement magnitude as a motion sanity check
-                if T_total >= 2:
-                    step_px = (
-                        fwd_tracks[:, :, 1:, :] - fwd_tracks[:, :, :-1, :]
-                    ).norm(dim=-1).mean()
+            per_seq_rows.append([
+                seq_name,
+                int(metric["num_query_points"]),
+                int(metric["num_gt_points"]),
+                metric["delta_avg"],
+                metric["mean_dist_px"],
+                metric["median_dist_px"],
+                *[metric[f"acc_{int(th)}px"] for th in STIR_THRESHOLDS_PX],
+            ])
+            self.logger.info(
+                f"  STIR {seq_name}: δavg={metric['delta_avg']:.4f} "
+                f"mean={metric['mean_dist_px']:.2f}px N={int(metric['num_query_points'])}",
+                context="TRACKING",
+            )
+
+            if seq_name == video_seq:
+                # Build a **sparse** per-query GT trajectory: start pos at
+                # t=0, matched end-center at t=T-1, linearly interpolated in
+                # between. Visibility is True only at the two keyframes so the
+                # GT overlay hides the unknown intermediate frames.
+                end_pts_proc = ds.end_points.to(pred_tracks.device)  # [N_end, 2]
+                if end_pts_proc.numel() > 0:
+                    pred_end_proc = pred_tracks[:, -1, :]  # [N_start, 2] in proc
+                    dmat = torch.cdist(
+                        pred_end_proc.unsqueeze(0), end_pts_proc.unsqueeze(0),
+                    ).squeeze(0)  # [N_start, N_end]
+                    nn_end_idx = dmat.argmin(dim=1)  # [N_start]
+                    matched_end = end_pts_proc[nn_end_idx]  # [N_start, 2]
                 else:
-                    step_px = torch.zeros((), device=self.device)
-                vis_ratio = (
-                    torch.sigmoid(fwd_vis_logit).mean()
-                )
+                    matched_end = pred_tracks[:, -1, :].clone()
 
-            stir_scalars = {
-                f"{prefix}/{safe}/cycle_err_mean_px": float(cycle_err.detach().cpu()),
-                f"{prefix}/{safe}/mean_step_px": float(step_px.detach().cpu()),
-                f"{prefix}/{safe}/visibility_ratio": float(vis_ratio.detach().cpu()),
-                f"{prefix}/{safe}/num_frames": float(T_total),
-            }
+                N_start = pred_tracks.shape[0]
+                alpha = torch.linspace(
+                    0.0, 1.0, T_total, device=pred_tracks.device,
+                ).view(1, T_total, 1)  # [1, T, 1]
+                gt_traj_proc = (1.0 - alpha) * start_pts.to(
+                    pred_tracks.device
+                ).unsqueeze(1) + alpha * matched_end.unsqueeze(1)
+                # [N_start, T, 2]
+                gt_vis = torch.zeros(N_start, T_total, dtype=torch.bool)
+                gt_vis[:, 0] = True
+                gt_vis[:, -1] = True
 
-            trajectories = fwd_tracks.squeeze(0).permute(1, 0, 2).cpu()
-            video_path = os.path.join(out_dir, f"stir_{safe}_ep{epoch:04d}.mp4")
-            try:
-                render_tracks_video(
-                    dataset=ds,
-                    trajectories=trajectories,
-                    output_path=video_path,
-                    fps=max(fps, 4),
-                    trail_length=max(5, fps),
-                    point_radius=3,
-                )
-            except RuntimeError as e:
-                self.logger.warning(f"STIR val video: {e}", context="TRACKING")
-                video_path = ""
-
-            if self.wandb is not None:
+                pred_errors = (
+                    pred_tracks.cpu() - gt_traj_proc.cpu()
+                ).norm(dim=-1)  # [N_start, T]
+                vid_grid = os.path.join(out_dir, f"stir_{safe}_grid_ep{epoch:04d}.mp4")
+                vid_cmp = os.path.join(out_dir, f"stir_{safe}_cmp_ep{epoch:04d}.mp4")
                 try:
-                    payload = {
-                        **stir_scalars,
-                        **self._wandb_epoch_axis_dict(epoch),
-                    }
-                    if video_path and os.path.isfile(video_path):
-                        payload[f"{prefix}/{safe}/dense_video"] = wandb.Video(
-                            video_path, fps=max(fps, 4), format="mp4"
-                        )
-                    self.wandb.log(payload)
-                except Exception as e:
-                    self.logger.warning(f"STIR val wandb: {e}", context="TRACKING")
-            del ds, all_frames, tr_out, rev_out
+                    render_tracks_video(
+                        dataset=ds,
+                        trajectories=pred_tracks.permute(1, 0, 2).cpu(),  # [T, N, 2]
+                        output_path=vid_grid,
+                        fps=max(fps, 4),
+                        trail_length=max(5, fps),
+                        point_radius=3,
+                    )
+                    render_comparison_video(
+                        dataset=ds,
+                        pred_trajectories=pred_tracks.permute(1, 0, 2).cpu(),
+                        gt_trajectories=gt_traj_proc.permute(1, 0, 2).cpu(),
+                        output_path=vid_cmp,
+                        fps=max(fps, 4),
+                        trail_length=max(5, fps),
+                        point_radius=3,
+                        visibility=gt_vis,
+                        errors=pred_errors,
+                        gate_prediction_on_gt_vis=False,
+                    )
+                except RuntimeError as e:
+                    self.logger.warning(
+                        f"STIR val video {seq_name}: {e}", context="TRACKING",
+                    )
+                    vid_grid = vid_cmp = ""
+                caption = f"[ep {epoch}] {seq_name}"
+                if vid_grid and os.path.isfile(vid_grid):
+                    video_payload[f"{prefix}/dense_video"] = wandb.Video(
+                        vid_grid, fps=max(fps, 4), format="mp4", caption=caption,
+                    )
+                if vid_cmp and os.path.isfile(vid_cmp):
+                    video_payload[f"{prefix}/gt_vs_pred_video"] = wandb.Video(
+                        vid_cmp, fps=max(fps, 4), format="mp4", caption=caption,
+                    )
+
+            del ds, all_frames, gt_out, pred_tracks
             torch.cuda.empty_cache()
+
+        if not per_seq_rows:
             return
+
+        delta_vals = [r[3] for r in per_seq_rows]
+        mean_dist_vals = [r[4] for r in per_seq_rows]
+        median_dist_vals = [r[5] for r in per_seq_rows]
+        threshold_acc = {
+            int(th): [r[7 + j] for r in per_seq_rows]
+            for j, th in enumerate(STIR_THRESHOLDS_PX)
+        }
+        agg_payload: Dict[str, Any] = {
+            f"{prefix}/delta_avg_mean": float(np.nanmean(delta_vals)),
+            f"{prefix}/mean_dist_px_mean": float(np.nanmean(mean_dist_vals)),
+            f"{prefix}/median_dist_px_mean": float(np.nanmean(median_dist_vals)),
+            f"{prefix}/num_sequences": int(len(per_seq_rows)),
+            **{
+                f"{prefix}/acc_{th}px_mean": float(np.nanmean(threshold_acc[th]))
+                for th in threshold_acc
+            },
+            **self._wandb_epoch_axis_dict(epoch),
+        }
+        self.logger.info(
+            f">> STIR val ({len(per_seq_rows)} seqs): "
+            f"δavg={agg_payload[f'{prefix}/delta_avg_mean']:.4f} "
+            f"mean_dist={agg_payload[f'{prefix}/mean_dist_px_mean']:.2f}px",
+            context="TRACKING",
+        )
+        if self.wandb is not None:
+            try:
+                table = wandb.Table(
+                    columns=[
+                        "sequence",
+                        "num_query",
+                        "num_gt",
+                        "delta_avg",
+                        "mean_dist_px",
+                        "median_dist_px",
+                        *[f"acc_{int(th)}px" for th in STIR_THRESHOLDS_PX],
+                    ],
+                    data=per_seq_rows,
+                )
+                payload = {
+                    **agg_payload,
+                    **video_payload,
+                    f"{prefix}/per_sequence": table,
+                }
+                self.wandb.log(payload)
+            except Exception as e:
+                self.logger.warning(f"STIR val wandb: {e}", context="TRACKING")
 
     def _tracking_validate_pseudo_novelview(self, epoch: int) -> None:
         if not bool(self.config.get("TRACKING_VAL_PSEUDO_NOVELVIEW", True)):

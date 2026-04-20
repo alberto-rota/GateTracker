@@ -89,8 +89,12 @@ def register_wandb_step_axes(wb: Any) -> None:
     # same ``log`` dict but may chart on the default step until flattened.
     wb.define_metric("Test/tracking/*", step_metric="step/test_eval")
     wb.define_metric("Test/tracking/eval/*", step_metric="step/test_eval")
+    wb.define_metric("Test/tracking/eval/stereomis/*", step_metric="step/test_eval")
+    wb.define_metric("Test/tracking/eval/stir/*", step_metric="step/test_eval")
     wb.define_metric("Test/Summary", step_metric="step/test_eval")
     wb.define_metric("Validation/tracking/eval/*", step_metric="step/epoch")
+    wb.define_metric("Validation/tracking/eval/stereomis/*", step_metric="step/epoch")
+    wb.define_metric("Validation/tracking/eval/stir/*", step_metric="step/epoch")
 
 
 METRIC_CATEGORIES = {

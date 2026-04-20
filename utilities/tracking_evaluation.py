@@ -274,6 +274,7 @@ def render_comparison_video(
     errors: torch.Tensor | None = None,
     error_max_px: float = 16.0,
     gt_color: tuple[int, int, int] = (255, 255, 255),
+    gate_prediction_on_gt_vis: bool = True,
 ) -> str:
     """Render a comparison MP4 with GT tracks and error-colored predicted tracks.
 
@@ -298,6 +299,11 @@ def render_comparison_video(
             from the two trajectories if not provided.
         error_max_px: Pixel error that saturates to red. Default 16.0.
         gt_color: BGR color for GT tracks. Default white (255, 255, 255).
+        gate_prediction_on_gt_vis: When True (default, legacy behaviour),
+            predicted tracks are hidden at frames where GT visibility is False.
+            Set to False when GT is sparse (e.g. STIR, where GT is only given
+            at ``t=0`` and ``t=T-1``) so that the predicted trajectory keeps
+            being drawn across the frames where GT is unknown.
 
     Returns:
         The output_path on success.
@@ -337,40 +343,48 @@ def render_comparison_video(
         t_start = max(0, t - trail_length)
 
         for i in range(n_pts):
-            if vis_np is not None and not vis_np[i, t]:
+            gt_visible_here = vis_np is None or bool(vis_np[i, t])
+            # Legacy behaviour: the prediction is also suppressed wherever GT
+            # is invisible. For sparse-GT datasets (STIR) we flip the flag so
+            # the prediction keeps being drawn across unlabelled frames.
+            skip_point_entirely = (
+                gate_prediction_on_gt_vis and vis_np is not None and not vis_np[i, t]
+            )
+            if skip_point_entirely:
                 continue
 
             # --- GT trail + point (drawn first, underneath) ---
-            if t > 0:
-                gt_traj = gt_np[t_start : t + 1, i, :]  # [L, 2]
-                gp1 = gt_traj[:-1].round().astype("int32")
-                gp2 = gt_traj[1:].round().astype("int32")
-                for k in range(gp1.shape[0]):
-                    seg_t = t_start + k
-                    if vis_np is not None and (
-                        not vis_np[i, seg_t] or not vis_np[i, seg_t + 1]
-                    ):
-                        continue
-                    alpha = float(k + 1) / max(gp1.shape[0], 1)
-                    thickness = max(1, int(2 * alpha))
-                    cv2.line(
-                        frame_bgr,
-                        (int(gp1[k, 0]), int(gp1[k, 1])),
-                        (int(gp2[k, 0]), int(gp2[k, 1])),
-                        gt_color,
-                        thickness,
-                        cv2.LINE_AA,
-                    )
+            if gt_visible_here:
+                if t > 0:
+                    gt_traj = gt_np[t_start : t + 1, i, :]  # [L, 2]
+                    gp1 = gt_traj[:-1].round().astype("int32")
+                    gp2 = gt_traj[1:].round().astype("int32")
+                    for k in range(gp1.shape[0]):
+                        seg_t = t_start + k
+                        if vis_np is not None and (
+                            not vis_np[i, seg_t] or not vis_np[i, seg_t + 1]
+                        ):
+                            continue
+                        alpha = float(k + 1) / max(gp1.shape[0], 1)
+                        thickness = max(1, int(2 * alpha))
+                        cv2.line(
+                            frame_bgr,
+                            (int(gp1[k, 0]), int(gp1[k, 1])),
+                            (int(gp2[k, 0]), int(gp2[k, 1])),
+                            gt_color,
+                            thickness,
+                            cv2.LINE_AA,
+                        )
 
-            gx, gy = gt_np[t, i, :]
-            cv2.circle(
-                frame_bgr,
-                (int(round(gx)), int(round(gy))),
-                gt_radius,
-                gt_color,
-                1,
-                cv2.LINE_AA,
-            )
+                gx, gy = gt_np[t, i, :]
+                cv2.circle(
+                    frame_bgr,
+                    (int(round(gx)), int(round(gy))),
+                    gt_radius,
+                    gt_color,
+                    1,
+                    cv2.LINE_AA,
+                )
 
             # --- Predicted trail + point (error-colored, on top) ---
             pred_color = _error_to_bgr(err_np[i, t], error_max_px)
@@ -385,7 +399,7 @@ def render_comparison_video(
                         not pred_vis_np[i, seg_t] or not pred_vis_np[i, seg_t + 1]
                     ):
                         continue
-                    if vis_np is not None and (
+                    if gate_prediction_on_gt_vis and vis_np is not None and (
                         not vis_np[i, seg_t] or not vis_np[i, seg_t + 1]
                     ):
                         continue

@@ -21,6 +21,7 @@ import json
 import os
 from typing import Any, Optional
 
+import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -31,6 +32,36 @@ def _match_any_glob(name: str, globs: list[str] | None) -> bool:
     if not globs:
         return True
     return any(fnmatch.fnmatch(name, g) for g in globs)
+
+
+def _contour_centers_from_seg(seg_path: str) -> np.ndarray:
+    """Extract bounding-box centers of connected components from a STIR segmentation PNG.
+
+    Mirrors :func:`STIRLoader.getcentersfromseg` so the ground-truth IR tattoo
+    locations are in native (1280, 1024) pixel coordinates.
+
+    Returns:
+        centers: ``[N, 2]`` float32 array of ``(x, y)`` pixel centers in the
+        coordinate system of the segmentation image. Empty ``[0, 2]`` when no
+        contours are found.
+    """
+    if not os.path.isfile(seg_path):
+        return np.zeros((0, 2), dtype=np.float32)
+    seg = cv2.imread(seg_path, cv2.IMREAD_UNCHANGED)
+    if seg is None:
+        return np.zeros((0, 2), dtype=np.float32)
+    if seg.ndim == 3:
+        seg = cv2.cvtColor(seg, cv2.COLOR_BGR2GRAY)
+    seg = (seg > 0).astype(np.uint8) * 255
+    contours, _ = cv2.findContours(seg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return np.zeros((0, 2), dtype=np.float32)
+    centers = np.empty((len(contours), 2), dtype=np.float32)  # [N, 2]
+    for i, c in enumerate(contours):
+        x, y, w, h = cv2.boundingRect(c)
+        centers[i, 0] = x + w / 2.0
+        centers[i, 1] = y + h / 2.0
+    return centers
 
 
 def _read_mp4_rgb_uint8(path: str) -> torch.Tensor:
@@ -120,6 +151,30 @@ class STIRTracking(Dataset):
         if os.path.isfile(calib_path):
             self._K, self._baseline = _try_parse_stir_calib(calib_path)
 
+        # ---- Sparse GT from IR segmentations (start/end tattoo centers) ----
+        # STIR only provides the segmentation of the IR-visible tattoos at the
+        # first and last frame of the clip. Centers are extracted in the
+        # *original* pixel grid of the segmentation PNG (1280x1024 on the
+        # public datasets) and mirrored to the (possibly resized) processing
+        # grid used by the rest of the pipeline via a simple affine scale.
+        seq_dir_full = os.path.join(root, self.sequence)
+        start_seg = os.path.join(seq_dir_full, "segmentation", "icgstartseg.png")
+        end_seg = os.path.join(seq_dir_full, "segmentation", "icgendseg.png")
+        start_np = _contour_centers_from_seg(start_seg)  # [N_start, 2] in orig
+        end_np = _contour_centers_from_seg(end_seg)      # [N_end,   2] in orig
+        sx = self.width / max(self._w0, 1)
+        sy = self.height / max(self._h0, 1)
+        self._start_points_orig = torch.from_numpy(start_np).float()  # [N_start, 2]
+        self._end_points_orig = torch.from_numpy(end_np).float()      # [N_end,   2]
+        scale_xy = torch.tensor([sx, sy], dtype=torch.float32).view(1, 2)
+        self._start_points = self._start_points_orig * scale_xy       # [N_start, 2]
+        self._end_points = self._end_points_orig * scale_xy           # [N_end,   2]
+        self._orig_size = (int(self._h0), int(self._w0))
+
+        # StereoMIS-style ``tracking_points`` / ``visibility`` are not available
+        # for STIR (only two keyframes). Kept ``None`` so callers that guard on
+        # ``ds.tracking_points is None`` still short-circuit the dense TAP-Vid
+        # path.
         self._tracking_points: torch.Tensor | None = None
         self._visibility: torch.Tensor | None = None
         self._poses = torch.eye(4, dtype=torch.float32).unsqueeze(0).expand(len(self), -1, -1).clone()
@@ -139,6 +194,31 @@ class STIRTracking(Dataset):
     @property
     def baseline(self):
         return self._baseline
+
+    @property
+    def start_points(self) -> torch.Tensor:
+        """Tattoo centers at ``t = 0`` in processing pixel coords. ``[N_start, 2]``."""
+        return self._start_points
+
+    @property
+    def end_points(self) -> torch.Tensor:
+        """Tattoo centers at ``t = T-1`` in processing pixel coords. ``[N_end, 2]``."""
+        return self._end_points
+
+    @property
+    def start_points_orig(self) -> torch.Tensor:
+        """Tattoo centers at ``t = 0`` in native segmentation pixel coords. ``[N_start, 2]``."""
+        return self._start_points_orig
+
+    @property
+    def end_points_orig(self) -> torch.Tensor:
+        """Tattoo centers at ``t = T-1`` in native segmentation pixel coords. ``[N_end, 2]``."""
+        return self._end_points_orig
+
+    @property
+    def orig_size(self) -> tuple[int, int]:
+        """``(H_orig, W_orig)`` of the native STIR frames (before resizing)."""
+        return self._orig_size
 
     def __len__(self) -> int:
         return int(self._frames.shape[0])
