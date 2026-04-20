@@ -27,7 +27,7 @@ parameters:
   IMAGE_WIDTH:
     value: 448
   BATCH_SIZE:
-    value: 32
+    value: 16
   # singlegpu | dp | ddp (CLI ``--ddp`` / ``--dp`` / ``--single`` overrides this)
   DISTRIBUTE:
     value: "singlegpu"
