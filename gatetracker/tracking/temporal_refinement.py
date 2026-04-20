@@ -7,6 +7,8 @@ them through K iterations of local correlation + temporal mixing.
 """
 
 import math
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -37,6 +39,63 @@ def _fourier_position_encoding(
     enc = torch.cat([x.sin(), x.cos()], dim=-1)  # [..., D, num_bands*2]
     enc = enc.flatten(-2)  # [..., D * num_bands * 2]
     return torch.cat([coords, enc], dim=-1)  # [..., D * (num_bands*2 + 1)]
+
+
+class CrossPointAttentionBlock(nn.Module):
+    """Per-frame multi-head self-attention over the query axis ``Q``.
+
+    Given per-point hidden states ``x[b, q, t, d]`` and current track positions
+    ``xy[b, q, t, 2]``, this block mixes information **across points** within
+    each frame independently. A learned gate scalar initialised to ``0`` makes
+    the block identity at init, preserving the behaviour of configurations that
+    disable it (``TEMPORAL_POINT_ATTN=False``).
+
+    Complexity: ``O(B T Q^2 D / H)`` per call (chunked along frames when memory
+    bites). Intended for ``Q <= ~1024``; larger ``Q`` should fall back to chunks
+    over ``Q`` (not implemented here — left as future work).
+    """
+
+    def __init__(self, hidden_dim: int, num_heads: int = 4):
+        super().__init__()
+        self.num_heads = int(max(1, num_heads))
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.attn = nn.MultiheadAttention(
+            hidden_dim, num_heads=self.num_heads, batch_first=True,
+        )
+        # Small MLP to turn (xy, t) into an additive positional bias for the
+        # query / key so the attention has an explicit spatial prior.
+        self.pos_mlp = nn.Sequential(
+            nn.Linear(3, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        # Gated residual: zero at init → identity → back-compat.
+        self.gate = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x: torch.Tensor, xy: torch.Tensor, t_idx: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x:     [B, Q, T, D] hidden state.
+            xy:    [B, Q, T, 2] current track positions (pixel coords); used for
+                   positional bias. Normalised internally by its own max.
+            t_idx: [1, 1, T, 1] temporal index in [0, 1].
+
+        Returns:
+            [B, Q, T, D] updated hidden state.
+        """
+        B, Q, T, D = x.shape
+        # Normalise xy to ~[-1, 1] so the positional MLP is scale-invariant.
+        denom = xy.detach().abs().amax(dim=(1, 2), keepdim=True).clamp_min(1.0)
+        xy_n = xy / denom  # [B, Q, T, 2]
+        pos_in = torch.cat([xy_n, t_idx.expand(B, Q, -1, -1)], dim=-1)  # [B, Q, T, 3]
+        pos_bias = self.pos_mlp(pos_in)  # [B, Q, T, D]
+
+        h = self.norm(x) + pos_bias  # [B, Q, T, D]
+        # Per-frame attention: reshape [B, Q, T, D] → [B*T, Q, D].
+        h = h.permute(0, 2, 1, 3).reshape(B * T, Q, D).contiguous()
+        out, _ = self.attn(h, h, h, need_weights=False)
+        out = out.reshape(B, T, Q, D).permute(0, 2, 1, 3).contiguous()  # [B, Q, T, D]
+        return x + self.gate * out
 
 
 class TemporalMixerBlock(nn.Module):
@@ -97,6 +156,8 @@ class TemporalRefinementNetwork(nn.Module):
         kernel_size: int = 5,
         pos_encoding_bands: int = 16,
         softmax_temperature: float = 0.1,
+        use_point_attention: bool = False,
+        point_attention_heads: int = 4,
     ):
         """
         Args:
@@ -111,6 +172,11 @@ class TemporalRefinementNetwork(nn.Module):
                 sub-pixel offset applied at every iteration. Mirrors the matching
                 refiner's ``FINE_REFINEMENT_TEMPERATURE`` so the temporal network
                 inherits the same continuous (non-snap) localization.
+            use_point_attention: If ``True``, append a :class:`CrossPointAttentionBlock`
+                (per-frame attention over the ``Q`` axis) after the temporal
+                blocks at every iteration. Gated residual initialised to zero
+                keeps behaviour identical to disabled until the gate is learned.
+            point_attention_heads: Head count for the cross-point attention.
         """
         super().__init__()
         self.feature_dim = feature_dim
@@ -119,6 +185,7 @@ class TemporalRefinementNetwork(nn.Module):
         self.corr_radius = corr_radius
         self.pos_encoding_bands = pos_encoding_bands
         self.softmax_temperature = float(softmax_temperature)
+        self.use_point_attention = bool(use_point_attention)
 
         corr_window = (2 * corr_radius + 1) ** 2
         # xy (2 dims) + time (1 dim) → each with (2*bands + 1) encoding
@@ -129,6 +196,12 @@ class TemporalRefinementNetwork(nn.Module):
         self.blocks = nn.ModuleList([
             TemporalMixerBlock(hidden_dim, kernel_size) for _ in range(num_blocks)
         ])
+        if self.use_point_attention:
+            self.point_attn = CrossPointAttentionBlock(
+                hidden_dim, num_heads=int(point_attention_heads),
+            )
+        else:
+            self.point_attn = None
         self.delta_head = nn.Linear(hidden_dim, 2)
         self.vis_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
@@ -177,8 +250,10 @@ class TemporalRefinementNetwork(nn.Module):
         the work is automatically chunked along the query axis.
 
         Args:
-            query_features: [B, Q, C] query descriptors from frame 0
-                (already L2-normalized by ``sample_embeddings_at_points``).
+            query_features: ``[B, Q, C]`` or ``[B, Q, K, C]`` query descriptors.
+                When the anchor axis ``K`` is present, correlations / soft-argmax
+                logits are computed per anchor and reduced by ``max`` over ``K``
+                (single-anchor behaviour recovered at ``K = 1``).
             feature_maps:   [B, T, C, H_f, W_f] fine feature maps.
             positions:      [B, Q, T, 2] current position estimates (pixel coords).
             feature_stride: Pixel stride of the feature map.
@@ -188,7 +263,17 @@ class TemporalRefinementNetwork(nn.Module):
             soft_argmax_delta: [B, Q, T, 2] expected sub-pixel shift in pixel units.
         """
         B, T, C, H_f, W_f = feature_maps.shape
-        Q = query_features.shape[1]
+        # Collapse optional anchor axis: accept both [B, Q, C] and [B, Q, K, C].
+        if query_features.dim() == 3:
+            qf_bqkc = query_features.unsqueeze(2)  # [B, Q, 1, C]
+        elif query_features.dim() == 4:
+            qf_bqkc = query_features  # [B, Q, K, C]
+        else:
+            raise ValueError(
+                f"query_features must be 3D or 4D, got shape {tuple(query_features.shape)}",
+            )
+        K = qf_bqkc.shape[2]
+        Q = qf_bqkc.shape[1]
         r = self.corr_radius
         W_w = 2 * r + 1
 
@@ -210,7 +295,7 @@ class TemporalRefinementNetwork(nn.Module):
         delta_chunks = []
         for q_start in range(0, Q, q_chunk):
             q_end = min(q_start + q_chunk, Q)
-            qf = query_features[:, q_start:q_end]              # [B, q, C]
+            qf = qf_bqkc[:, q_start:q_end]                      # [B, q, K, C]
             pos = positions[:, q_start:q_end]                   # [B, q, T, 2]
 
             feat_coords = pos / feature_stride                  # [B, q, T, 2]
@@ -233,12 +318,16 @@ class TemporalRefinementNetwork(nn.Module):
             sampled = sampled.squeeze(-1).reshape(B, T, C, q, W_w * W_w)
             sampled = sampled.permute(0, 3, 1, 4, 2)  # [B, q, T, W_w^2, C]
 
-            query_exp = qf.unsqueeze(2).unsqueeze(3)  # [B, q, 1, 1, C]
-            corr_chunk = (sampled * query_exp).sum(dim=-1)  # [B, q, T, W_w^2]
+            # Broadcast anchors: [B, q, 1, 1, K, C] x [B, q, T, W_w^2, 1, C]
+            query_exp = qf.unsqueeze(2).unsqueeze(3)  # [B, q, 1, 1, K, C]
+            sampled_exp = sampled.unsqueeze(-2)        # [B, q, T, W_w^2, 1, C]
+            corr_k = (sampled_exp * query_exp).sum(dim=-1)  # [B, q, T, W_w^2, K]
+            corr_chunk = corr_k.amax(dim=-1)  # [B, q, T, W_w^2]
 
-            q_norm = F.normalize(qf, dim=-1).unsqueeze(2).unsqueeze(3)
-            s_norm = F.normalize(sampled, dim=-1)
-            logits = (s_norm * q_norm).sum(dim=-1)  # [B, q, T, W_w^2]
+            q_norm = F.normalize(qf, dim=-1).unsqueeze(2).unsqueeze(3)  # [B, q, 1, 1, K, C]
+            s_norm = F.normalize(sampled, dim=-1).unsqueeze(-2)          # [B, q, T, W_w^2, 1, C]
+            logits_k = (s_norm * q_norm).sum(dim=-1)  # [B, q, T, W_w^2, K]
+            logits = logits_k.amax(dim=-1)            # [B, q, T, W_w^2]
             probs = torch.softmax(logits * inv_temp, dim=-1)
             soft_argmax_delta_chunk = (
                 probs.unsqueeze(-1) * offset_pixels_view
@@ -246,8 +335,10 @@ class TemporalRefinementNetwork(nn.Module):
 
             corr_chunks.append(corr_chunk)
             delta_chunks.append(soft_argmax_delta_chunk)
-            del sampled, sample_norm, sample_coords, grid_flat, logits, probs
+            del sampled, sampled_exp, sample_norm, sample_coords, grid_flat
+            del corr_k, logits_k, logits, probs
 
+        _ = K  # silence unused-variable linters when K == 1
         if len(corr_chunks) == 1:
             return corr_chunks[0], delta_chunks[0]
         return torch.cat(corr_chunks, dim=1), torch.cat(delta_chunks, dim=1)
@@ -258,14 +349,20 @@ class TemporalRefinementNetwork(nn.Module):
         query_features: torch.Tensor,
         feature_maps: torch.Tensor,
         feature_stride: int,
+        num_iters: Optional[int] = None,
     ) -> dict:
         """Run iterative temporal refinement.
 
         Args:
             coarse_tracks:  [B, Q, T, 2] initial position estimates from global matching.
-            query_features: [B, Q, C] fine feature descriptors at query positions (frame 0).
+            query_features: [B, Q, C] or [B, Q, K, C] fine feature descriptor(s) at
+                query positions. When a bank of ``K`` anchors is passed the local
+                correlation is reduced with ``max`` over anchors (see
+                :meth:`_extract_local_correlation`).
             feature_maps:   [B, T, C, H_f, W_f] fine feature maps for all frames.
             feature_stride: Pixel stride of the fine feature map.
+            num_iters:      Optional override on the number of refinement iterations
+                (weights are shared). Defaults to the constructor ``num_iters``.
 
         Returns:
             dict with:
@@ -284,8 +381,10 @@ class TemporalRefinementNetwork(nn.Module):
         # Initialize hidden state
         hidden = torch.zeros(B * Q, T, self.hidden_dim, device=device, dtype=dtype)
 
+        n_iters = int(num_iters) if num_iters is not None else self.num_iters
+        n_iters = max(1, n_iters)
         all_vis_logits = []
-        for _iter in range(self.num_iters):
+        for _iter in range(n_iters):
             # 1. Local correlation + deterministic soft-argmax sub-pixel offset.
             #    ``soft_argmax_delta`` is the exact same quantity that the matching
             #    refiner (``feature_softargmax_refiner``) uses, just evaluated at
@@ -317,6 +416,11 @@ class TemporalRefinementNetwork(nn.Module):
 
             for block in self.blocks:
                 x = block(x)  # [BQ, T, hidden_dim]
+
+            if self.point_attn is not None:
+                x_bqtd = x.reshape(B, Q, T, self.hidden_dim)
+                x_bqtd = self.point_attn(x_bqtd, current_tracks, t_idx)
+                x = x_bqtd.reshape(B * Q, T, self.hidden_dim)
 
             hidden = x  # [BQ, T, hidden_dim]
 

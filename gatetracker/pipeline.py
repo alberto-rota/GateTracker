@@ -131,6 +131,7 @@ def run_pipeline(
         config.BATCH_SIZE = 1
         config.EPOCHS = 1
         config.NO_WANDB = True
+        # Also caps StereoMIS/STIR rank-0 validation (short prefix, few clips) to avoid OOM.
         config.FEWFRAMES = True
 
     try:

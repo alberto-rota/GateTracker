@@ -1600,7 +1600,7 @@ class PseudoGTGenerator:
             [255, 220, 0], device=dev, dtype=torch.uint8
         )
         dbg[(~gap_mask) & (~conflict_mask)] = torch.tensor(
-            [0, 200, 0], device=dev, dtype=torch.uint8
+            [0, 0, 0], device=dev, dtype=torch.uint8
         )
         zbuf_debug = dbg.view(B, H, W, 3)
 
@@ -1760,25 +1760,49 @@ class PseudoGTGenerator:
         trail_length: int = 8,
         log_to_rerun: bool = True,
         zbuf_overlay_alpha: float = 0.0,
+        predicted_visibility: Optional[torch.Tensor] = None,
+        predicted_tracks: Optional[torch.Tensor] = None,
+        draw_legend: bool = True,
     ) -> None:
         """Write an MP4 video with track dots and coloured trails.
 
-        Optionally logs each annotated frame to the active Rerun recording
-        under ``video/annotated``.
+        Visibility is rendered explicitly:
 
-        Parameters
-        ----------
-        result : PseudoGTResult
-        path : str
-            Output ``.mp4`` file path.
-        fps : int
-        trail_length : int
-            How many past frames to include in the polyline trail.
-        log_to_rerun : bool
-            Also log annotated frames to Rerun if a recording is active.
-        zbuf_overlay_alpha : float
-            Blend ``[0, 1]`` for z-buffer debug overlay; ``0`` = off.  When
-            ``> 0``, output is side-by-side: tracks | tracks + overlay.
+        * **visible GT** — solid filled circle, bright trail.
+        * **occluded GT** — hollow coloured ring + semi-transparent fill +
+          dashed / faded trail. The point is still shown at its (warped)
+          ground-truth location so you can see *where* the tracker should
+          recover the track to once visibility returns.
+
+        When ``predicted_visibility`` is given, each point also gets an
+        outer confusion-matrix ring with the colour convention
+
+        =============================  =================================
+        prediction vs. GT              outer ring colour (BGR)
+        =============================  =================================
+        visible (TP) / occluded (TN)   green  — correct visibility
+        predicted visible but occluded red    — false positive (FP)
+        predicted occluded but visible orange — false negative (FN)
+        =============================  =================================
+
+        Args:
+            result:                A :class:`PseudoGTResult`.
+            path:                  Output ``.mp4`` file path.
+            fps:                   Output frame rate.
+            trail_length:          Polyline history length.
+            log_to_rerun:          Also log annotated frames to Rerun if
+                a recording is active.
+            zbuf_overlay_alpha:    Blend ``[0, 1]`` for z-buffer debug
+                overlay; ``0`` = off. When ``> 0`` the output is
+                side-by-side: tracks | tracks + overlay.
+            predicted_visibility:  Optional bool/float tensor ``[T, Q]``
+                (or ``[Q, T]``). When given, a coloured outer ring
+                encodes prediction-vs-GT confusion.
+            predicted_tracks:      Optional ``[T, Q, 2]`` tensor with the
+                predicted pixel coordinates. When given, the predicted
+                point is drawn as a small white diamond so you can
+                eyeball the position error next to the GT dot.
+            draw_legend:           Draw an in-frame legend (top-right).
         """
         import cv2
         from matplotlib import colormaps
@@ -1806,13 +1830,103 @@ class PseudoGTGenerator:
         writer = cv2.VideoWriter(tmp_path, fourcc, fps, (out_w, H))
 
         trk = result.tracks.cpu().numpy().astype(np.int32)  # [T, Q, 2]
-        vis = result.visibility.cpu().numpy()  # [T, Q]
+        vis = result.visibility.cpu().numpy().astype(bool)  # [T, Q]
+
+        # Optional prediction tensors — accept [T, Q] or [Q, T] for visibility.
+        pred_vis_np: Optional[np.ndarray] = None
+        if predicted_visibility is not None:
+            pv = predicted_visibility.detach().cpu()
+            if pv.dtype != torch.bool:
+                pv = pv > 0.5
+            pv = pv.numpy()
+            if pv.shape == (Q, T):
+                pv = pv.T
+            if pv.shape != (T, Q):
+                raise ValueError(
+                    f"predicted_visibility must have shape [T={T}, Q={Q}] "
+                    f"or [Q, T]; got {tuple(pv.shape)}"
+                )
+            pred_vis_np = pv
+
+        pred_trk_np: Optional[np.ndarray] = None
+        if predicted_tracks is not None:
+            pt = predicted_tracks.detach().cpu().numpy()
+            if pt.shape != (T, Q, 2):
+                raise ValueError(
+                    f"predicted_tracks must have shape [T={T}, Q={Q}, 2]; "
+                    f"got {tuple(pt.shape)}"
+                )
+            pred_trk_np = pt.astype(np.int32)
 
         try:
             import rerun as rr
             has_rr = log_to_rerun
         except ImportError:
             has_rr = False
+
+        # Pre-computed drawing helpers ---------------------------------
+        def _dashed_polyline(
+            img_bgr: np.ndarray,
+            pts_xy: np.ndarray,  # [L, 2] int32
+            color_bgr: tuple,
+            thickness: int = 1,
+            dash: int = 4,
+            gap: int = 3,
+        ) -> None:
+            """Draw a dashed polyline (cv2 has no native dashed stroke)."""
+            if pts_xy.shape[0] < 2:
+                return
+            for k in range(pts_xy.shape[0] - 1):
+                p1 = pts_xy[k]
+                p2 = pts_xy[k + 1]
+                seg = np.linalg.norm(p2 - p1)
+                if seg < 1e-3:
+                    continue
+                n = max(1, int(np.ceil(seg / (dash + gap))))
+                t_vals = np.linspace(0, 1, 2 * n + 1)
+                for m in range(n):
+                    a = p1 + (p2 - p1) * t_vals[2 * m]
+                    b = p1 + (p2 - p1) * t_vals[2 * m + 1]
+                    cv2.line(
+                        img_bgr,
+                        (int(a[0]), int(a[1])),
+                        (int(b[0]), int(b[1])),
+                        color_bgr, thickness, cv2.LINE_AA,
+                    )
+
+        def _draw_legend(img_bgr: np.ndarray) -> None:
+            lines = [
+                ("visible GT (filled)",     (255, 255, 255),   "filled"),
+                ("occluded GT (hollow)",    (255, 255, 255),   "hollow"),
+            ]
+            if pred_vis_np is not None:
+                lines.extend([
+                    ("pred = GT (green)",       (0, 200, 0),   "ring"),
+                    ("false positive (red)",    (0, 0, 255),   "ring"),
+                    ("false negative (orange)", (0, 140, 255), "ring"),
+                ])
+            x0, y0 = img_bgr.shape[1] - 210, 10
+            pad = 6
+            h = 18 * len(lines) + pad * 2
+            overlay = img_bgr.copy()
+            cv2.rectangle(
+                overlay, (x0 - pad, y0 - pad), (img_bgr.shape[1] - 2, y0 + h),
+                (0, 0, 0), -1,
+            )
+            cv2.addWeighted(overlay, 0.5, img_bgr, 0.5, 0.0, img_bgr)
+            for i, (label, col, kind) in enumerate(lines):
+                yy = y0 + 12 + 18 * i
+                cx = x0 + 8
+                if kind == "filled":
+                    cv2.circle(img_bgr, (cx, yy - 4), 4, col, -1, cv2.LINE_AA)
+                elif kind == "hollow":
+                    cv2.circle(img_bgr, (cx, yy - 4), 4, col, 1, cv2.LINE_AA)
+                else:
+                    cv2.circle(img_bgr, (cx, yy - 4), 5, col, 1, cv2.LINE_AA)
+                cv2.putText(
+                    img_bgr, label, (cx + 12, yy),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (240, 240, 240), 1, cv2.LINE_AA,
+                )
 
         for t in range(T):
             img = (
@@ -1821,36 +1935,76 @@ class PseudoGTGenerator:
                 .astype(np.uint8)
             )
             canvas = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-
             t0 = max(0, t - trail_length)
+
+            # -- Trails: solid for visible-to-visible, dashed for boundaries --
             for qi in range(Q):
-                v_win = vis[t0 : t + 1, qi]
-                if v_win.sum() < 2:
+                pts_win = trk[t0 : t + 1, qi]           # [L, 2]
+                v_win = vis[t0 : t + 1, qi]             # [L]
+                if pts_win.shape[0] < 2:
                     continue
-                pts = trk[t0 : t + 1, qi][v_win]
                 color = tuple(int(c) for c in colors_bgr[qi])
-                cv2.polylines(
-                    canvas, [pts], False, color, 1, cv2.LINE_AA
-                )
+                faded = tuple(int(0.5 * c + 0.5 * 90) for c in color)
 
-            vis_idx = np.where(vis[t])[0]
-            occ_idx = np.where(~vis[t])[0]
-            for qi in vis_idx:
-                cv2.circle(
-                    canvas, tuple(trk[t, qi]), 3,
-                    tuple(int(c) for c in colors_bgr[qi]),
-                    -1, cv2.LINE_AA,
-                )
-            for qi in occ_idx:
-                cv2.circle(
-                    canvas, tuple(trk[t, qi]), 2,
-                    (80, 80, 80), -1, cv2.LINE_AA,
-                )
+                # iterate segment-by-segment
+                for k in range(pts_win.shape[0] - 1):
+                    p1 = pts_win[k]
+                    p2 = pts_win[k + 1]
+                    v1, v2 = bool(v_win[k]), bool(v_win[k + 1])
+                    if v1 and v2:
+                        cv2.line(
+                            canvas, (int(p1[0]), int(p1[1])),
+                            (int(p2[0]), int(p2[1])), color, 1, cv2.LINE_AA,
+                        )
+                    else:
+                        # at least one endpoint occluded → dashed faint line
+                        _dashed_polyline(
+                            canvas, np.stack([p1, p2], axis=0), faded,
+                            thickness=1, dash=3, gap=3,
+                        )
 
-            cv2.putText(
-                canvas, f"t={t:03d}", (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2,
-            )
+            # -- Current-frame markers ---------------------------------
+            for qi in range(Q):
+                center = (int(trk[t, qi, 0]), int(trk[t, qi, 1]))
+                color = tuple(int(c) for c in colors_bgr[qi])
+                is_vis = bool(vis[t, qi])
+
+                if is_vis:
+                    # Filled visible marker
+                    cv2.circle(canvas, center, 3, color, -1, cv2.LINE_AA)
+                    cv2.circle(canvas, center, 3, (0, 0, 0), 1, cv2.LINE_AA)
+                else:
+                    # Hollow occluded marker: semi-transparent fill
+                    # + coloured outline so the user still sees *where*
+                    # the point should be while it is occluded.
+                    overlay = canvas.copy()
+                    cv2.circle(overlay, center, 3, color, -1, cv2.LINE_AA)
+                    cv2.addWeighted(overlay, 0.35, canvas, 0.65, 0.0, canvas)
+                    cv2.circle(canvas, center, 4, color, 1, cv2.LINE_AA)
+
+                # Optional prediction overlay ring: outer confusion ring.
+                if pred_vis_np is not None:
+                    pred = bool(pred_vis_np[t, qi])
+                    if pred == is_vis:
+                        ring_bgr = (0, 200, 0)       # green — correct
+                    elif pred and not is_vis:
+                        ring_bgr = (0, 0, 255)       # red — FP
+                    else:
+                        ring_bgr = (0, 140, 255)     # orange — FN
+                    cv2.circle(canvas, center, 6, ring_bgr, 1, cv2.LINE_AA)
+
+                # Optional predicted position marker (small white diamond).
+                if pred_trk_np is not None:
+                    px, py = pred_trk_np[t, qi, 0], pred_trk_np[t, qi, 1]
+                    pts = np.array([
+                        [px, py - 3], [px + 3, py], [px, py + 3], [px - 3, py],
+                    ], dtype=np.int32)
+                    cv2.polylines(
+                        canvas, [pts], True, (255, 255, 255), 1, cv2.LINE_AA,
+                    )
+
+            if draw_legend:
+                _draw_legend(canvas)
 
             if has_zbuf:
                 overlay_rgb = zbuf_np[t]

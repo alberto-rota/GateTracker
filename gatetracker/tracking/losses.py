@@ -72,13 +72,52 @@ def composite_supervision_mask(
     height: int,
     width: int,
 ) -> torch.Tensor:
-    """M[b,q,t] = vis_gt & w_rgb & in_bounds (float 0/1)."""
+    """M[b,q,t] = vis_gt & w_rgb & in_bounds (float 0/1).
+
+    This is the **visibility-gated** mask used for self-supervised losses
+    (descriptor / feature / cycle) that require a trustworthy appearance at
+    the tracked location. For the supervised **position** loss see
+    :func:`position_supervision_mask`, which drops the visibility gate so
+    the model learns to predict the correct pixel coordinate of a query
+    *even when it is temporarily occluded*.
+    """
     if vis_gt_bqt.dtype == torch.bool:
         vis = vis_gt_bqt
     else:
         vis = vis_gt_bqt > 0.5
     ib = in_bounds_mask_bqt(tracks_gt_bqt2, height, width)
     m = vis & (w_rgb_bqt > 0.5) & ib
+    return m.to(dtype=tracks_gt_bqt2.dtype)
+
+
+def position_supervision_mask(
+    w_rgb_bqt: torch.Tensor,
+    tracks_gt_bqt2: torch.Tensor,
+    height: int,
+    width: int,
+    rgb_threshold: float = 0.5,
+) -> torch.Tensor:
+    """Position-loss mask that **includes occluded frames**.
+
+    The pseudo-GT pipeline warps each query's 3-D point along the full
+    trajectory, so the projected pixel coordinate is meaningful even when
+    the point falls behind a closer surface (z-buffer occlusion) or under
+    a sprite occluder. We therefore supervise position regressio on every
+    in-bounds, RGB-valid frame and only gate the **visibility head** on
+    ``vis_gt``. This teaches the tracker to persist through short
+    occlusions and recover the pre-occlusion track (``"stabilize the track"``).
+
+    Args:
+        w_rgb_bqt:      ``[B, Q, T]`` novel-view RGB validity in ``[0, 1]``.
+        tracks_gt_bqt2: ``[B, Q, T, 2]`` pseudo-GT pixel coords.
+        height, width:  Image dimensions.
+        rgb_threshold:  Minimum ``w_rgb`` to trust a frame.
+
+    Returns:
+        ``[B, Q, T]`` float mask (0 / 1) with the same dtype as ``tracks_gt``.
+    """
+    ib = in_bounds_mask_bqt(tracks_gt_bqt2, height, width)
+    m = (w_rgb_bqt > float(rgb_threshold)) & ib
     return m.to(dtype=tracks_gt_bqt2.dtype)
 
 
@@ -89,34 +128,80 @@ def temporal_supervised_losses(
     composite_mask: torch.Tensor,
     vis_target: torch.Tensor,
     config,
+    position_mask: Optional[torch.Tensor] = None,
+    vis_gt: Optional[torch.Tensor] = None,
 ) -> dict:
     """Masked Huber position + BCE visibility vs pseudo-GT.
 
+    Position supervision is applied on **both** visible and occluded frames
+    so the tracker learns to predict the pre-occlusion pixel coordinate and
+    keep the trajectory stable through short occlusions. Occluded frames
+    are weighted by ``TEMPORAL_SUP_POS_OCC_WEIGHT`` (default ``0.25``) so
+    visible frames still dominate but the occluded ones contribute a
+    non-zero gradient.
+
     Args:
-        tracks_pred:      [B, Q, T, 2]
-        visibility_pred:  [B, Q, T] logits
-        tracks_gt:        [B, Q, T, 2]
-        composite_mask:   [B, Q, T] bool/float — position supervision mask.
-        vis_target:       [B, Q, T] float in [0,1] for BCE (appearance-aware or strict).
+        tracks_pred:      ``[B, Q, T, 2]`` predicted pixel coordinates.
+        visibility_pred:  ``[B, Q, T]`` predicted visibility logits.
+        tracks_gt:        ``[B, Q, T, 2]`` pseudo-GT pixel coordinates.
+        composite_mask:   ``[B, Q, T]`` bool/float — **visible** frames with
+            trustworthy RGB. Used as the visible region of the position
+            supervision mask when ``position_mask`` is ``None`` (legacy
+            behaviour) and to weight occluded vs visible frames when
+            ``position_mask`` is provided.
+        vis_target:       ``[B, Q, T]`` float in ``[0, 1]`` for BCE.
         config:           DotMap.
+        position_mask:    Optional ``[B, Q, T]`` broader mask that also
+            includes occluded but in-bounds / RGB-valid frames — see
+            :func:`position_supervision_mask`. When provided, position
+            loss is evaluated with per-frame weights that down-weight
+            occluded frames by ``TEMPORAL_SUP_POS_OCC_WEIGHT``.
 
     Returns:
-        dict with ``loss_sup_total``, ``loss_sup_pos``, ``loss_sup_vis``, ``metrics``.
+        dict with ``loss_sup_total``, ``loss_sup_pos``, ``loss_sup_vis``,
+        ``metrics``.
     """
     huber_beta = float(config.get("TEMPORAL_SUP_HUBER_BETA", 1.0))
     eps = 1e-6
 
-    mpos = composite_mask.to(dtype=tracks_pred.dtype)  # [B, Q, T]
+    dtype = tracks_pred.dtype
+    visible_m = composite_mask.to(dtype=dtype)  # [B, Q, T]
+
     diff = tracks_pred - tracks_gt
     dist = diff.norm(dim=-1)  # [B, Q, T]
     loss_h = F.smooth_l1_loss(
         dist, torch.zeros_like(dist), beta=huber_beta, reduction="none",
     )
-    loss_pos = (loss_h * mpos).sum() / (mpos.sum().clamp_min(eps))
 
-    vt = vis_target.to(dtype=tracks_pred.dtype).clamp(0.0, 1.0)
-    # Class-imbalanced BCE: occluded frames are rarer; up-weight negatives so the
-    # head does not collapse to "always visible" under the position losses.
+    if position_mask is None:
+        # Legacy: only supervise position on visible frames.
+        pos_w = visible_m
+        pos_denom = pos_w.sum().clamp_min(eps)
+    else:
+        w_occ_pos = float(config.get("TEMPORAL_SUP_POS_OCC_WEIGHT", 0.25))
+        pmask = position_mask.to(dtype=dtype)
+        # pos_w = pmask * (visible ? 1 : w_occ_pos) ;  note visible_m ⊂ pmask.
+        pos_w = pmask * (visible_m + (1.0 - visible_m) * w_occ_pos)
+        pos_denom = pos_w.sum().clamp_min(eps)
+
+    # Reappearance up-weighting: frames where vis_gt transitions 0 -> 1 are
+    # exactly the frames where the tracker must *recover* from occlusion. We
+    # amplify the position loss on those frames (and only those frames). This
+    # is the loss term that directly targets "occlusion-robust tracking". The
+    # weight is applied on top of ``pos_w`` so it interacts correctly with the
+    # occluded/visible balance above.
+    w_reappear = float(config.get("TEMPORAL_SUP_POS_REAPPEAR_WEIGHT", 0.0))
+    if w_reappear > 0.0 and vis_gt is not None and tracks_pred.shape[2] > 1:
+        vg = vis_gt.to(dtype=dtype).clamp(0.0, 1.0)
+        prev_vis = torch.cat([vg[:, :, :1], vg[:, :, :-1]], dim=-1)  # [B, Q, T]
+        reappear = ((vg > 0.5) & (prev_vis <= 0.5)).to(dtype=dtype)
+        # Multiplicative bump: visible+reappear frames get (1 + w_reappear) weight.
+        bump = 1.0 + w_reappear * reappear
+        pos_w = pos_w * bump
+        pos_denom = pos_w.sum().clamp_min(eps)
+    loss_pos = (loss_h * pos_w).sum() / pos_denom
+
+    vt = vis_target.to(dtype=dtype).clamp(0.0, 1.0)
     w_occ = float(config.get("TEMPORAL_SUP_VIS_OCC_WEIGHT", 1.0))
     w_vis_el = 1.0 + (w_occ - 1.0) * (1.0 - vt)  # [B, Q, T]
     bce = F.binary_cross_entropy_with_logits(
@@ -128,12 +213,32 @@ def temporal_supervised_losses(
     w_vis = float(config.get("TEMPORAL_SUP_VIS_WEIGHT", 1.0))
     loss_sup_total = w_pos * loss_pos + w_vis * loss_vis
 
-    frac_sup = float(mpos.mean().item())
+    # Per-frame diagnostic: fraction of position supervision landing on
+    # occluded frames (non-zero only when ``position_mask`` is provided).
+    occl_frac = 0.0
+    if position_mask is not None:
+        pmask_f = position_mask.to(dtype=dtype)
+        occl_mass = (pmask_f * (1.0 - visible_m)).sum()
+        occl_frac = float((occl_mass / pmask_f.sum().clamp_min(eps)).item())
+
+    reappear_frac = 0.0
+    if (
+        w_reappear > 0.0
+        and vis_gt is not None
+        and tracks_pred.shape[2] > 1
+    ):
+        vg = vis_gt.to(dtype=dtype).clamp(0.0, 1.0)
+        prev_vis = torch.cat([vg[:, :, :1], vg[:, :, :-1]], dim=-1)
+        reappear = ((vg > 0.5) & (prev_vis <= 0.5)).to(dtype=dtype)
+        reappear_frac = float(reappear.mean().item())
+
     metrics = {
         "loss_sup_pos": loss_pos.item(),
         "loss_sup_vis": loss_vis.item(),
         "loss_sup_total": loss_sup_total.item(),
-        "sup_mask_fraction": frac_sup,
+        "sup_mask_fraction": float(visible_m.mean().item()),
+        "sup_pos_occluded_fraction": occl_frac,
+        "sup_reappear_fraction": reappear_frac,
     }
     return {
         "loss_sup_total": loss_sup_total,
@@ -512,9 +617,17 @@ def temporal_descriptor_consistency_loss(
     patch_size: int,
     visibility: Optional[torch.Tensor] = None,
     self_sup_mask_bqt: Optional[torch.Tensor] = None,
+    decay_tau: float = 0.0,
 ) -> torch.Tensor:
-    """Penalize descriptor drift: query descriptor should match target descriptor
+    r"""Penalize descriptor drift: query descriptor should match target descriptor
     at tracked position across all T frames.
+
+    An exponential time decay :math:`w(t) = \exp(-|t - t_\text{anchor}| / \tau)`
+    (with ``t_anchor = 0`` for the frame-0 anchor) can be applied via
+    ``decay_tau``. This keeps the local-appearance prior strong but lets the
+    tracker survive long-horizon photometric change without being punished for
+    natural descriptor drift far from the anchor frame. ``decay_tau <= 0``
+    disables the decay (uniform weighting, back-compat).
 
     Args:
         tracks:          [B, Q, T, 2] tracked positions.
@@ -522,6 +635,8 @@ def temporal_descriptor_consistency_loss(
         descriptor_maps: List of T tensors, each [B, C, H_p, W_p].
         patch_size:      Patch size for descriptor sampling.
         visibility:      [B, Q, T] visibility logits (optional).
+        decay_tau:       Exponential decay time-constant (frames). ``0`` or
+            negative disables the decay.
 
     Returns:
         Scalar loss.
@@ -543,6 +658,11 @@ def temporal_descriptor_consistency_loss(
 
     cos_dist_stack = torch.stack(cos_dists, dim=-1)  # [B, Q, T]
 
+    if float(decay_tau) > 0.0 and T > 1:
+        t_idx = torch.arange(T, device=cos_dist_stack.device, dtype=cos_dist_stack.dtype)
+        decay_w = torch.exp(-t_idx.abs() / float(decay_tau)).view(1, 1, T)  # [1, 1, T]
+        cos_dist_stack = cos_dist_stack * decay_w
+
     if visibility is not None:
         vis_prob = torch.sigmoid(visibility).detach()
         cos_dist_stack = cos_dist_stack * vis_prob
@@ -563,10 +683,15 @@ def feature_persistence_loss(
     feature_stride: int,
     visibility: Optional[torch.Tensor] = None,
     self_sup_mask_bqt: Optional[torch.Tensor] = None,
+    decay_tau: float = 0.0,
 ) -> torch.Tensor:
-    """Fine feature at tracked location should remain similar to query's fine feature.
+    r"""Fine feature at tracked location should remain similar to query's fine feature.
 
     More robust than photometric loss in surgical scenes with lighting changes.
+    Accepts an exponential time decay
+    :math:`w(t) = \exp(-|t - t_\text{anchor}| / \tau)` with ``t_anchor = 0`` so
+    that long-horizon photometric drift does not dominate the loss when
+    appearance has legitimately changed far from the anchor frame.
 
     Args:
         tracks:            [B, Q, T, 2] tracked positions.
@@ -574,6 +699,8 @@ def feature_persistence_loss(
         fine_feature_maps: [B, T, C_f, H_f, W_f] fine feature maps.
         feature_stride:    Pixel stride of the fine feature map.
         visibility:        [B, Q, T] visibility logits (optional).
+        decay_tau:         Exponential decay time-constant (frames). ``0`` or
+            negative disables the decay (back-compat).
 
     Returns:
         Scalar loss.
@@ -595,6 +722,11 @@ def feature_persistence_loss(
         diffs.append(diff)
 
     diff_stack = torch.stack(diffs, dim=-1)  # [B, Q, T]
+
+    if float(decay_tau) > 0.0 and T > 1:
+        t_idx = torch.arange(T, device=diff_stack.device, dtype=diff_stack.dtype)
+        decay_w = torch.exp(-t_idx.abs() / float(decay_tau)).view(1, 1, T)
+        diff_stack = diff_stack * decay_w
 
     if visibility is not None:
         vis_prob = torch.sigmoid(visibility).detach()
@@ -691,6 +823,7 @@ def compute_temporal_tracking_losses(
     w_feat = float(config.get("TEMPORAL_FEATURE_LOSS_WEIGHT", 0.5))
     w_vis = float(config.get("TEMPORAL_VIS_REG_WEIGHT", 0.1))
     ent_scale = float(config.get("TEMPORAL_VIS_REG_ENTROPY_SCALE", 0.1))
+    decay_tau = float(config.get("TEMPORAL_DESC_DECAY_TAU", 0.0))
     w_synth = float(synth_self_sup_scale)
 
     loss_cycle = temporal_cycle_consistency_loss(
@@ -702,9 +835,11 @@ def compute_temporal_tracking_losses(
     )
     loss_desc = temporal_descriptor_consistency_loss(
         tracks, query_points, descriptor_maps, patch_size, visibility, self_sup_mask_bqt,
+        decay_tau=decay_tau,
     )
     loss_feat = feature_persistence_loss(
         tracks, query_points, fine_feature_maps, feature_stride, visibility, self_sup_mask_bqt,
+        decay_tau=decay_tau,
     )
     loss_vis = visibility_regularization_loss(visibility, entropy_scale=ent_scale)
 

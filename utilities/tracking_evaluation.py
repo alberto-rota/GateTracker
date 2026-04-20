@@ -134,8 +134,16 @@ def render_tracks_video(
     visibility: torch.Tensor | None = None,
     errors: torch.Tensor | None = None,
     error_max_px: float = 16.0,
+    hide_occluded: bool = False,
 ) -> str:
     """Render an MP4 video with trajectory overlays.
+
+    Visibility — when provided — is rendered explicitly rather than used as
+    a hard gate so that tracked points remain visible through short
+    occlusions. Occluded markers are drawn as **hollow coloured rings with a
+    faded alpha fill** and their trail segments are dashed and desaturated.
+    Set ``hide_occluded=True`` to fall back to the legacy skip-when-invisible
+    behaviour.
 
     Args:
         dataset: StereoMISTracking instance providing RGB frames.
@@ -144,14 +152,14 @@ def render_tracks_video(
         fps: Output video frame rate.
         trail_length: Number of past frames to draw as trail.
         point_radius: Radius of current-position circles.
-        visibility: Optional [N, T] bool tensor. When provided, only visible
-            points and trail segments are drawn at each frame.
+        visibility: Optional [N, T] bool tensor. When provided, occluded
+            points are drawn as hollow rings (unless ``hide_occluded=True``).
         errors: Optional [N, T] float tensor of per-point per-frame L2 pixel
-            errors. When provided, point and trail colors reflect the tracking
-            error on a green (0 px) to red (>=error_max_px) gradient instead
-            of the default per-point-index palette.
-        error_max_px: Pixel error that saturates to red. Default 16.0 (largest
-            TAP-Vid threshold).
+            errors. Green (0 px) → red (>=error_max_px) gradient, replacing
+            the default per-point-index palette.
+        error_max_px: Pixel error that saturates to red. Default 16.0.
+        hide_occluded: Legacy switch — when True, occluded points are not
+            drawn at all (trails & markers skipped).
 
     Returns:
         The output_path on success.
@@ -183,6 +191,30 @@ def render_tracks_video(
         raise RuntimeError(f"Could not open VideoWriter for: {output_path}")
 
     trajectories_np = trajectories.cpu().numpy()  # [T, N, 2]
+
+    def _dashed_line_bgr(
+        img: np.ndarray,
+        p1: tuple[int, int],
+        p2: tuple[int, int],
+        color: tuple[int, int, int],
+        thickness: int = 1,
+    ) -> None:
+        """Draw a dashed segment (cv2 has no dashed stroke primitive)."""
+        v = np.array([p2[0] - p1[0], p2[1] - p1[1]], dtype=np.float32)
+        dist = float(np.linalg.norm(v))
+        if dist < 1e-3:
+            return
+        n = max(1, int(np.ceil(dist / 6.0)))
+        tv = np.linspace(0.0, 1.0, 2 * n + 1, dtype=np.float32)
+        p1f = np.array(p1, dtype=np.float32)
+        for m in range(n):
+            a = p1f + v * tv[2 * m]
+            b = p1f + v * tv[2 * m + 1]
+            cv2.line(
+                img, (int(a[0]), int(a[1])), (int(b[0]), int(b[1])),
+                color, thickness, cv2.LINE_AA,
+            )
+
     for t in range(t_total):
         frame_rgb = (
             dataset[t]["image"].permute(1, 2, 0).numpy() * 255.0
@@ -191,7 +223,8 @@ def render_tracks_video(
 
         t_start = max(0, t - trail_length)
         for i in range(n_pts):
-            if vis_np is not None and not vis_np[i, t]:
+            is_visible = vis_np is None or bool(vis_np[i, t])
+            if hide_occluded and not is_visible:
                 continue
 
             pt_color = (
@@ -199,6 +232,7 @@ def render_tracks_video(
                 if err_np is not None
                 else index_colors[i]
             )
+            pt_color_faded = tuple(int(0.45 * c + 0.55 * 90) for c in pt_color)
 
             if t > 0:
                 traj = trajectories_np[t_start : t + 1, i, :]  # [L, 2]
@@ -206,43 +240,46 @@ def render_tracks_video(
                 p2 = traj[1:].round().astype("int32")
                 for k in range(p1.shape[0]):
                     seg_t = t_start + k
-                    if vis_np is not None and (
-                        not vis_np[i, seg_t] or not vis_np[i, seg_t + 1]
-                    ):
+                    v1 = vis_np is None or bool(vis_np[i, seg_t])
+                    v2 = vis_np is None or bool(vis_np[i, seg_t + 1])
+                    if hide_occluded and (not v1 or not v2):
                         continue
-                    seg_color = (
+                    seg_color_base = (
                         _error_to_bgr(err_np[i, seg_t + 1], error_max_px)
                         if err_np is not None
                         else index_colors[i]
                     )
                     alpha = float(k + 1) / max(p1.shape[0], 1)
                     thickness = max(1, int(2 * alpha))
-                    cv2.line(
-                        frame_bgr,
-                        (int(p1[k, 0]), int(p1[k, 1])),
-                        (int(p2[k, 0]), int(p2[k, 1])),
-                        seg_color,
-                        thickness,
-                        cv2.LINE_AA,
-                    )
+                    if v1 and v2:
+                        cv2.line(
+                            frame_bgr,
+                            (int(p1[k, 0]), int(p1[k, 1])),
+                            (int(p2[k, 0]), int(p2[k, 1])),
+                            seg_color_base, thickness, cv2.LINE_AA,
+                        )
+                    else:
+                        faded = tuple(int(0.45 * c + 0.55 * 90) for c in seg_color_base)
+                        _dashed_line_bgr(
+                            frame_bgr,
+                            (int(p1[k, 0]), int(p1[k, 1])),
+                            (int(p2[k, 0]), int(p2[k, 1])),
+                            faded, thickness=1,
+                        )
 
             x, y = trajectories_np[t, i, :]
-            cv2.circle(
-                frame_bgr,
-                (int(round(x)), int(round(y))),
-                point_radius,
-                pt_color,
-                -1,
-                cv2.LINE_AA,
-            )
-            cv2.circle(
-                frame_bgr,
-                (int(round(x)), int(round(y))),
-                point_radius,
-                (0, 0, 0),
-                1,
-                cv2.LINE_AA,
-            )
+            center = (int(round(x)), int(round(y)))
+            if is_visible:
+                cv2.circle(frame_bgr, center, point_radius, pt_color, -1, cv2.LINE_AA)
+                cv2.circle(frame_bgr, center, point_radius, (0, 0, 0), 1, cv2.LINE_AA)
+            else:
+                overlay = frame_bgr.copy()
+                cv2.circle(overlay, center, point_radius, pt_color, -1, cv2.LINE_AA)
+                cv2.addWeighted(overlay, 0.35, frame_bgr, 0.65, 0.0, frame_bgr)
+                cv2.circle(
+                    frame_bgr, center, point_radius + 1, pt_color_faded,
+                    1, cv2.LINE_AA,
+                )
 
         cv2.putText(
             frame_bgr,
@@ -275,12 +312,18 @@ def render_comparison_video(
     error_max_px: float = 16.0,
     gt_color: tuple[int, int, int] = (255, 255, 255),
     gate_prediction_on_gt_vis: bool = True,
+    hide_pred_when_occluded: bool = False,
 ) -> str:
     """Render a comparison MP4 with GT tracks and error-colored predicted tracks.
 
-    GT points are drawn as small hollow circles with thin trails in a fixed
-    color (default white). Predicted points are drawn as filled circles with
-    trails colored by per-frame error relative to GT.
+    GT points are drawn as small hollow circles; when GT visibility is False
+    they switch to a **dashed white trail** and are still rendered at the
+    GT position so the reader can verify whether the prediction recovers
+    to that location. Predicted points are error-coloured filled circles
+    when visible and hollow (alpha-blended) error-coloured rings when
+    predicted occluded. An **outer confusion ring** (green / red / orange)
+    is drawn around the predicted marker whenever both ``visibility`` and
+    ``pred_visibility`` are available.
 
     Args:
         dataset: StereoMISTracking instance providing RGB frames.
@@ -290,20 +333,21 @@ def render_comparison_video(
         fps: Output video frame rate.
         trail_length: Number of past frames to draw as trail.
         point_radius: Radius of current-position circles.
-        visibility: Optional [N, T] bool tensor (GT visibility). GT geometry is
-            hidden when GT visibility is False.
-        pred_visibility: Optional [N, T] bool tensor. When set, predicted trails
-            and points are hidden when this mask is False (independent of GT).
+        visibility: Optional [N, T] bool tensor (GT visibility).
+        pred_visibility: Optional [N, T] bool tensor of predicted visibility.
         errors: Optional [N, T] float tensor of per-point per-frame L2 pixel
             errors used for predicted track coloring. Computed automatically
             from the two trajectories if not provided.
         error_max_px: Pixel error that saturates to red. Default 16.0.
         gt_color: BGR color for GT tracks. Default white (255, 255, 255).
-        gate_prediction_on_gt_vis: When True (default, legacy behaviour),
-            predicted tracks are hidden at frames where GT visibility is False.
-            Set to False when GT is sparse (e.g. STIR, where GT is only given
-            at ``t=0`` and ``t=T-1``) so that the predicted trajectory keeps
-            being drawn across the frames where GT is unknown.
+        gate_prediction_on_gt_vis: When True (default legacy), predicted
+            tracks are hidden at frames where GT visibility is False. Set
+            to False for sparse-GT datasets (STIR) so the predicted
+            trajectory keeps being drawn across unlabelled frames.
+        hide_pred_when_occluded: When True, predicted markers are skipped
+            entirely on frames where ``pred_visibility`` is False (legacy).
+            Default False: predicted-occluded points are drawn as hollow
+            alpha-blended rings.
 
     Returns:
         The output_path on success.
@@ -334,6 +378,25 @@ def render_comparison_video(
 
     gt_radius = max(1, point_radius - 1)
 
+    def _dashed_line_bgr(
+        img: np.ndarray, p1: tuple[int, int], p2: tuple[int, int],
+        color: tuple[int, int, int], thickness: int = 1,
+    ) -> None:
+        v = np.array([p2[0] - p1[0], p2[1] - p1[1]], dtype=np.float32)
+        dist = float(np.linalg.norm(v))
+        if dist < 1e-3:
+            return
+        n = max(1, int(np.ceil(dist / 6.0)))
+        tv = np.linspace(0.0, 1.0, 2 * n + 1, dtype=np.float32)
+        p1f = np.array(p1, dtype=np.float32)
+        for m in range(n):
+            a = p1f + v * tv[2 * m]
+            b = p1f + v * tv[2 * m + 1]
+            cv2.line(
+                img, (int(a[0]), int(a[1])), (int(b[0]), int(b[1])),
+                color, thickness, cv2.LINE_AA,
+            )
+
     for t in range(t_total):
         frame_rgb = (
             dataset[t]["image"].permute(1, 2, 0).numpy() * 255.0
@@ -344,49 +407,49 @@ def render_comparison_video(
 
         for i in range(n_pts):
             gt_visible_here = vis_np is None or bool(vis_np[i, t])
-            # Legacy behaviour: the prediction is also suppressed wherever GT
-            # is invisible. For sparse-GT datasets (STIR) we flip the flag so
-            # the prediction keeps being drawn across unlabelled frames.
+            # Gate the *entire* point (both GT and prediction) on GT vis
+            # only for the legacy dense-GT use case.
             skip_point_entirely = (
                 gate_prediction_on_gt_vis and vis_np is not None and not vis_np[i, t]
             )
             if skip_point_entirely:
                 continue
 
-            # --- GT trail + point (drawn first, underneath) ---
-            if gt_visible_here:
-                if t > 0:
-                    gt_traj = gt_np[t_start : t + 1, i, :]  # [L, 2]
-                    gp1 = gt_traj[:-1].round().astype("int32")
-                    gp2 = gt_traj[1:].round().astype("int32")
-                    for k in range(gp1.shape[0]):
-                        seg_t = t_start + k
-                        if vis_np is not None and (
-                            not vis_np[i, seg_t] or not vis_np[i, seg_t + 1]
-                        ):
-                            continue
-                        alpha = float(k + 1) / max(gp1.shape[0], 1)
-                        thickness = max(1, int(2 * alpha))
+            # --- GT trail + point --------------------------------------
+            gt_faded = tuple(int(0.45 * c + 0.55 * 90) for c in gt_color)
+            if t > 0:
+                gt_traj = gt_np[t_start : t + 1, i, :]  # [L, 2]
+                gp1 = gt_traj[:-1].round().astype("int32")
+                gp2 = gt_traj[1:].round().astype("int32")
+                for k in range(gp1.shape[0]):
+                    seg_t = t_start + k
+                    v1 = vis_np is None or bool(vis_np[i, seg_t])
+                    v2 = vis_np is None or bool(vis_np[i, seg_t + 1])
+                    alpha = float(k + 1) / max(gp1.shape[0], 1)
+                    thickness = max(1, int(2 * alpha))
+                    if v1 and v2:
                         cv2.line(
                             frame_bgr,
                             (int(gp1[k, 0]), int(gp1[k, 1])),
                             (int(gp2[k, 0]), int(gp2[k, 1])),
-                            gt_color,
-                            thickness,
-                            cv2.LINE_AA,
+                            gt_color, thickness, cv2.LINE_AA,
+                        )
+                    else:
+                        _dashed_line_bgr(
+                            frame_bgr,
+                            (int(gp1[k, 0]), int(gp1[k, 1])),
+                            (int(gp2[k, 0]), int(gp2[k, 1])),
+                            gt_faded, 1,
                         )
 
-                gx, gy = gt_np[t, i, :]
-                cv2.circle(
-                    frame_bgr,
-                    (int(round(gx)), int(round(gy))),
-                    gt_radius,
-                    gt_color,
-                    1,
-                    cv2.LINE_AA,
-                )
+            gx, gy = gt_np[t, i, :]
+            gt_center = (int(round(gx)), int(round(gy)))
+            if gt_visible_here:
+                cv2.circle(frame_bgr, gt_center, gt_radius, gt_color, 1, cv2.LINE_AA)
+            else:
+                cv2.circle(frame_bgr, gt_center, gt_radius + 1, gt_faded, 1, cv2.LINE_AA)
 
-            # --- Predicted trail + point (error-colored, on top) ---
+            # --- Predicted trail + point (error-colored, on top) ------
             pred_color = _error_to_bgr(err_np[i, t], error_max_px)
 
             if t > 0:
@@ -395,9 +458,9 @@ def render_comparison_video(
                 pp2 = pred_traj[1:].round().astype("int32")
                 for k in range(pp1.shape[0]):
                     seg_t = t_start + k
-                    if pred_vis_np is not None and (
-                        not pred_vis_np[i, seg_t] or not pred_vis_np[i, seg_t + 1]
-                    ):
+                    pv1 = pred_vis_np is None or bool(pred_vis_np[i, seg_t])
+                    pv2 = pred_vis_np is None or bool(pred_vis_np[i, seg_t + 1])
+                    if hide_pred_when_occluded and (not pv1 or not pv2):
                         continue
                     if gate_prediction_on_gt_vis and vis_np is not None and (
                         not vis_np[i, seg_t] or not vis_np[i, seg_t + 1]
@@ -406,32 +469,49 @@ def render_comparison_video(
                     seg_color = _error_to_bgr(err_np[i, seg_t + 1], error_max_px)
                     alpha = float(k + 1) / max(pp1.shape[0], 1)
                     thickness = max(1, int(2 * alpha))
-                    cv2.line(
-                        frame_bgr,
-                        (int(pp1[k, 0]), int(pp1[k, 1])),
-                        (int(pp2[k, 0]), int(pp2[k, 1])),
-                        seg_color,
-                        thickness,
-                        cv2.LINE_AA,
-                    )
+                    if pv1 and pv2:
+                        cv2.line(
+                            frame_bgr,
+                            (int(pp1[k, 0]), int(pp1[k, 1])),
+                            (int(pp2[k, 0]), int(pp2[k, 1])),
+                            seg_color, thickness, cv2.LINE_AA,
+                        )
+                    else:
+                        faded = tuple(int(0.45 * c + 0.55 * 90) for c in seg_color)
+                        _dashed_line_bgr(
+                            frame_bgr,
+                            (int(pp1[k, 0]), int(pp1[k, 1])),
+                            (int(pp2[k, 0]), int(pp2[k, 1])),
+                            faded, 1,
+                        )
 
-            if pred_vis_np is None or pred_vis_np[i, t]:
-                px, py = pred_np[t, i, :]
+            px, py = pred_np[t, i, :]
+            pred_center = (int(round(px)), int(round(py)))
+            pred_is_visible = pred_vis_np is None or bool(pred_vis_np[i, t])
+            if hide_pred_when_occluded and not pred_is_visible:
+                pass
+            elif pred_is_visible:
+                cv2.circle(frame_bgr, pred_center, point_radius, pred_color, -1, cv2.LINE_AA)
+                cv2.circle(frame_bgr, pred_center, point_radius, (0, 0, 0), 1, cv2.LINE_AA)
+            else:
+                overlay = frame_bgr.copy()
+                cv2.circle(overlay, pred_center, point_radius, pred_color, -1, cv2.LINE_AA)
+                cv2.addWeighted(overlay, 0.35, frame_bgr, 0.65, 0.0, frame_bgr)
                 cv2.circle(
-                    frame_bgr,
-                    (int(round(px)), int(round(py))),
-                    point_radius,
-                    pred_color,
-                    -1,
-                    cv2.LINE_AA,
+                    frame_bgr, pred_center, point_radius + 1, pred_color, 1, cv2.LINE_AA,
                 )
+
+            # Outer confusion ring (needs both masks to be meaningful).
+            if pred_vis_np is not None and vis_np is not None:
+                gt_v = bool(vis_np[i, t])
+                if pred_is_visible == gt_v:
+                    ring_bgr = (0, 200, 0)
+                elif pred_is_visible and not gt_v:
+                    ring_bgr = (0, 0, 255)
+                else:
+                    ring_bgr = (0, 140, 255)
                 cv2.circle(
-                    frame_bgr,
-                    (int(round(px)), int(round(py))),
-                    point_radius,
-                    (0, 0, 0),
-                    1,
-                    cv2.LINE_AA,
+                    frame_bgr, pred_center, point_radius + 3, ring_bgr, 1, cv2.LINE_AA,
                 )
 
         cv2.putText(

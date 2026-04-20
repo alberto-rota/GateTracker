@@ -1,6 +1,7 @@
 """Distributed training helpers (DDP / DP). Mirrors UnReflectAnything DISTRIBUTE pattern."""
 
 import os
+from datetime import timedelta
 from typing import Any, List, Tuple
 
 import torch
@@ -90,7 +91,15 @@ def unwrap_model(model: nn.Module) -> nn.Module:
 
 
 def init_process_group_from_config(config: Any) -> None:
-    """Initialize torch.distributed when DISTRIBUTE==ddp (idempotent if already initialized)."""
+    """Initialize torch.distributed when DISTRIBUTE==ddp (idempotent if already initialized).
+
+    The NCCL collective watchdog timeout is configurable via
+    ``NCCL_TIMEOUT_MINUTES`` (default: 60 min). The default is raised well
+    above PyTorch's 10 min baseline so that rank-0-only validation work
+    (e.g. StereoMIS / STIR video rendering in the tracking phase) does not
+    trip the watchdog on the other ranks while they wait at the next
+    collective.
+    """
     if not is_ddp_enabled(config):
         return
     if dist_initialized():
@@ -98,7 +107,13 @@ def init_process_group_from_config(config: Any) -> None:
     backend = str(_cfg_get(config, "DISTBACKEND", "nccl"))
     if not torch.cuda.is_available() and backend == "nccl":
         backend = "gloo"
-    dist.init_process_group(backend=backend)
+    timeout_min = _cfg_get(config, "NCCL_TIMEOUT_MINUTES", 60)
+    try:
+        timeout_min = float(timeout_min)
+    except (TypeError, ValueError):
+        timeout_min = 60.0
+    timeout = timedelta(minutes=max(1.0, timeout_min))
+    dist.init_process_group(backend=backend, timeout=timeout)
 
 
 def fill_ddp_env_into_config(config: Any) -> None:

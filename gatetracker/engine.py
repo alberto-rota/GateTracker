@@ -41,6 +41,7 @@ from gatetracker.utils.training_phase import (
 )
 from gatetracker.distributed_context import (
     all_reduce_sum_scalars,
+    barrier,
     ddp_find_unused_parameters,
     is_ddp_enabled,
     is_main_process,
@@ -241,10 +242,27 @@ class Engine:
 
     def _track_long_sequence_infer_kwargs(self) -> Dict[str, Any]:
         """Keyword args for ``TemporalTracker.track_long_sequence`` from config."""
-        return {
+        kwargs: Dict[str, Any] = {
             "vis_agg": str(self.config.get("TRACKING_LONGSEQ_VIS_AGG", "mean")),
             "infer_max_step_px": float(self.config.get("TRACKING_INFER_MAX_STEP_PX", 0.0)),
+            "centrality_weighting": bool(
+                self.config.get("TRACKING_LONGSEQ_CENTRALITY", False),
+            ),
+            "anchor_bank_size": int(self.config.get("TRACKING_ANCHOR_BANK_SIZE", 1)),
+            "anchor_refresh_vis_thresh": float(
+                self.config.get("TRACKING_ANCHOR_REFRESH_VIS_THRESH", 0.9),
+            ),
+            "redetection": bool(self.config.get("TRACKING_REDETECTION", False)),
+            "redetect_after": int(self.config.get("TRACKING_REDETECT_AFTER", 5)),
+            "redetect_topk": int(self.config.get("TRACKING_REDETECT_TOPK", 8)),
+            "redetect_vis_thresh": float(
+                self.config.get("TRACKING_REDETECT_VIS_THRESH", 0.3),
+            ),
         }
+        iters_infer = self.config.get("TEMPORAL_REFINEMENT_NUM_ITERS_INFER", None)
+        if iters_infer is not None:
+            kwargs["num_iters"] = int(iters_infer)
+        return kwargs
 
     def _namespace_refinement_metrics(self, metrics_dict, phase_prefix):
         """
@@ -1339,6 +1357,7 @@ class Engine:
                     [ds[t]["image"] for t in range(len(ds))], dim=0,
                 ).unsqueeze(0).to(self.device)  # [1, T, 3, H, W]
 
+            grid_vis_np: torch.Tensor | None = None
             if has_temporal_tracker:
                 with torch.no_grad():
                     tracker_out = self.temporal_tracker.track_long_sequence(
@@ -1348,6 +1367,11 @@ class Engine:
                         **self._track_long_sequence_infer_kwargs(),
                     )
                 trajectories = tracker_out["tracks"].squeeze(0).permute(1, 0, 2).cpu()  # [T, N, 2]
+                grid_vis_logits = tracker_out.get("visibility", None)
+                if grid_vis_logits is not None:
+                    grid_vis_np = (
+                        torch.sigmoid(grid_vis_logits.squeeze(0)) > 0.5
+                    ).cpu()  # [N, T]
             elif use_windowed:
                 trajectories = infer_tracks_windowed(
                     dataset=ds,
@@ -1374,6 +1398,7 @@ class Engine:
                         fps=max(stereomis_fps, 4),
                         trail_length=max(5, stereomis_fps),
                         point_radius=3,
+                        visibility=grid_vis_np,
                     )
                     self.logger.info(
                         f"  Saved tracking video: {video_path}", context="TEST",
@@ -1474,10 +1499,14 @@ class Engine:
                             trail_length=max(5, stereomis_fps),
                             point_radius=3,
                             visibility=gt_vis,
+                            # Always pass predicted visibility when available
+                            # so the video explicitly renders occluded-vs-
+                            # visible predictions and the outer confusion ring.
                             pred_visibility=(
-                                pred_vis if (has_temporal_tracker and gate_pred) else None
+                                pred_vis if has_temporal_tracker else None
                             ),
                             errors=pixel_errors,
+                            hide_pred_when_occluded=gate_pred,
                         )
                         self.logger.info(
                             f"  Saved GT-vs-pred comparison video: {cmp_video_path}",
@@ -1583,6 +1612,12 @@ class Engine:
                             **self._track_long_sequence_infer_kwargs(),
                         )
                     pred_tracks_gt = gt_tracker_out["tracks"].squeeze(0)  # [N_start, T, 2]
+                    _gt_vis_logits_stir = gt_tracker_out.get("visibility", None)
+                    pred_vis_gt_stir: torch.Tensor | None = None
+                    if _gt_vis_logits_stir is not None:
+                        pred_vis_gt_stir = (
+                            torch.sigmoid(_gt_vis_logits_stir.squeeze(0)) > 0.5
+                        ).cpu()  # [N_start, T]
                     sx = float(w_orig) / max(float(width), 1.0)
                     sy = float(h_orig) / max(float(height), 1.0)
                     pred_end_orig = pred_tracks_gt[:, -1, :].clone()
@@ -1616,6 +1651,7 @@ class Engine:
                 is_chosen_video = seq_name == stir_video_seq
                 if is_chosen_video:
                     grid_pts = make_grid_points(h, w, grid_h=grid_size, grid_w=grid_size)
+                    grid_vis_np: torch.Tensor | None = None
                     if has_temporal_tracker:
                         with torch.no_grad():
                             tracker_out = self.temporal_tracker.track_long_sequence(
@@ -1625,6 +1661,11 @@ class Engine:
                                 **self._track_long_sequence_infer_kwargs(),
                             )
                         trajectories = tracker_out["tracks"].squeeze(0).permute(1, 0, 2).cpu()
+                        grid_vis_logits = tracker_out.get("visibility", None)
+                        if grid_vis_logits is not None:
+                            grid_vis_np = (
+                                torch.sigmoid(grid_vis_logits.squeeze(0)) > 0.5
+                            ).cpu()  # [N, T]
                     elif use_windowed:
                         trajectories = infer_tracks_windowed(
                             dataset=ds,
@@ -1648,6 +1689,7 @@ class Engine:
                             fps=max(stir_fps, 4),
                             trail_length=max(5, stir_fps),
                             point_radius=3,
+                            visibility=grid_vis_np,
                         )
                     except RuntimeError as e:
                         self.logger.info(
@@ -1698,6 +1740,7 @@ class Engine:
                                 trail_length=max(5, stir_fps),
                                 point_radius=3,
                                 visibility=gt_vis,
+                                pred_visibility=pred_vis_gt_stir,
                                 errors=pred_errors,
                                 gate_prediction_on_gt_vis=False,
                             )
@@ -2715,15 +2758,27 @@ class Engine:
                 del frames, loss_dict, loss_total
                 torch.cuda.empty_cache()
 
+        # DDP collective BEFORE any rank-0-only work. If we synced AFTER
+        # ``_tracking_validation_tracking_epoch`` (which only runs on rank 0
+        # and can take many minutes for StereoMIS + STIR video rendering),
+        # non-main ranks would sit at the 2-element ALLREDUCE below and trip
+        # the NCCL watchdog. Doing the reduce first keeps all ranks in
+        # lock-step on collectives, and a ``barrier()`` after the main-only
+        # block resynchronises before the next epoch. Also made
+        # unconditional on ``epoch_losses`` so an empty-epoch rank cannot
+        # silently skip the collective and desync.
+        _sum = float(np.sum(epoch_losses)) if epoch_losses else 0.0
+        _cnt = float(len(epoch_losses))
+        if is_ddp_enabled(self.config):
+            _sum, _cnt = all_reduce_sum_scalars(_sum, _cnt, self.device)
+        mean_loss = _sum / max(_cnt, 1.0)
+
         if not TRAINING:
             self._tracking_validation_tracking_epoch(epoch)
-
-        if epoch_losses:
-            _sum = float(np.sum(epoch_losses))
-            _cnt = float(len(epoch_losses))
             if is_ddp_enabled(self.config):
-                _sum, _cnt = all_reduce_sum_scalars(_sum, _cnt, self.device)
-            mean_loss = _sum / max(_cnt, 1.0)
+                barrier()
+
+        if _cnt > 0:
             self.logger.info(
                 f">> {phase} epoch {epoch+1} mean loss: {mean_loss:.4f}",
                 context="TRACKING",
@@ -2792,6 +2847,32 @@ class Engine:
             out[f"{base}/pseudo_gt/{k}"] = v
         return out
 
+    def _tracking_val_fewframes_caps(self) -> Tuple[bool, Optional[int], int]:
+        """When ``FEWFRAMES`` is true (``--boot``), cap external val clips.
+
+        Full STIR / StereoMIS sequences can be hundreds of frames; stacking
+        ``[1, T, 3, H, W]`` on GPU for every ``VAL_VIDEOS`` clip exhausts VRAM
+        and the OS OOM-killer reports ``Killed``. Boot smoke-tests only need a
+        short prefix of a couple of clips.
+
+        Returns:
+            use_caps: apply sequence / frame limits.
+            max_frames: ``stop`` for dataset constructors (``None`` = full clip).
+            max_sequences: max number of validation clips to iterate.
+        """
+        if not bool(self.config.get("FEWFRAMES")):
+            return False, None, 1_000_000
+        win = int(
+            self.config.get(
+                "TRACKING_SEQUENCE_LENGTH",
+                self.config.get("TRACKING_WINDOW_SIZE", 16),
+            )
+        )
+        # [1, T, 3, H, W] on GPU — keep T modest (OOM-safe); at least 2× window.
+        max_frames = max(win * 2, 48)
+        max_sequences = 2
+        return True, max_frames, max_sequences
+
     def _tracking_validation_tracking_epoch(self, epoch: int) -> None:
         """StereoMIS + STIR val metrics/videos and pseudo novel-view clip (main rank)."""
         if not hasattr(self, "temporal_tracker") or self.temporal_tracker is None:
@@ -2843,6 +2924,15 @@ class Engine:
             self.logger.info("StereoMIS val: no sequences after VAL_VIDEOS filter.", context="TRACKING")
             return
 
+        few_use, few_frames, few_max_seq = self._tracking_val_fewframes_caps()
+        if few_use:
+            val_seqs = val_seqs[:few_max_seq]
+            self.logger.info(
+                f"StereoMIS val: FEWFRAMES cap → {len(val_seqs)} seq(s), "
+                f"max_frames={few_frames}",
+                context="TRACKING",
+            )
+
         mf = self.config.get("TRACKING_STEREOMIS_VAL_MAX_FRAMES", None)
         stop: Optional[int] = None
         if mf is not None and mf != "":
@@ -2852,6 +2942,8 @@ class Engine:
                     stop = iv
             except (TypeError, ValueError):
                 pass
+        if few_use and stop is None:
+            stop = few_frames
 
         height = int(self.height)
         width = int(self.width)
@@ -2920,6 +3012,12 @@ class Engine:
                     **self._track_long_sequence_infer_kwargs(),
                 )
                 grid_traj = grid_out["tracks"].squeeze(0).permute(1, 0, 2).cpu()
+                grid_vis_logits = grid_out.get("visibility", None)
+                grid_vis_np: torch.Tensor | None = None
+                if grid_vis_logits is not None:
+                    grid_vis_np = (
+                        torch.sigmoid(grid_vis_logits.squeeze(0)) > 0.5
+                    ).cpu()  # [N, T]
                 gt_init = ds.tracking_points[:, 0, :].to(self.device)
                 gt_out = self.temporal_tracker.track_long_sequence(
                     gt_init.unsqueeze(0),
@@ -2961,16 +3059,16 @@ class Engine:
                         fps=max(fps, 4),
                         trail_length=max(5, fps),
                         point_radius=3,
+                        visibility=grid_vis_np,
                     )
                     pixel_errors = (pred_tracks.cpu() - gt_tracks.cpu()).norm(dim=-1)
                     gt_vid = gt_tracks.permute(1, 0, 2).cpu()
                     pred_vid = pred_tracks.permute(1, 0, 2).cpu()
-                    # At early training the visibility head outputs logits ≈ 0
-                    # → sigmoid(0) = 0.5 → ``pred_vis = False`` for every point,
-                    # which would hide every predicted circle/trail. Gate on
-                    # the predicted mask only when the user explicitly asks
-                    # for it; otherwise always draw predictions (they stay
-                    # color-coded by ``errors``).
+                    # We now always pass the predicted visibility so the
+                    # renderer can draw occluded predictions as hollow rings
+                    # plus the outer green/red/orange confusion ring.
+                    # ``TRACKING_VAL_COMP_GATE_PREDVIS`` toggles the legacy
+                    # behaviour of actually *hiding* predicted-occluded points.
                     gate_pred = bool(self.config.get(
                         "TRACKING_VAL_COMP_GATE_PREDVIS", False,
                     ))
@@ -2983,8 +3081,9 @@ class Engine:
                         trail_length=max(5, fps),
                         point_radius=3,
                         visibility=gt_vis.cpu(),
-                        pred_visibility=(pred_vis.cpu() if gate_pred else None),
+                        pred_visibility=pred_vis.cpu(),
                         errors=pixel_errors,
+                        hide_pred_when_occluded=gate_pred,
                     )
                 except RuntimeError as e:
                     self.logger.warning(f"StereoMIS val video {seq_name}: {e}", context="TRACKING")
@@ -3087,6 +3186,15 @@ class Engine:
         if not val_seqs:
             return
 
+        few_use, few_frames, few_max_seq = self._tracking_val_fewframes_caps()
+        stir_stop: Optional[int] = few_frames if few_use else None
+        if few_use:
+            val_seqs = val_seqs[:few_max_seq]
+            self.logger.info(
+                f"STIR val: FEWFRAMES cap → {len(val_seqs)} seq(s), stop={stir_stop}",
+                context="TRACKING",
+            )
+
         height = int(self.height)
         width = int(self.width)
         window_size = int(
@@ -3100,7 +3208,27 @@ class Engine:
         os.makedirs(out_dir, exist_ok=True)
         prefix = "Validation/tracking/eval/stir"
         rng = random.Random(int(self.config.get("TRACKING_VAL_VIDEO_SEED", 0)) + int(epoch) + 7919)
-        video_seq = rng.choice(val_seqs) if val_seqs else None
+
+        # Pre-filter to sequences that will actually survive the metric loop
+        # below (loadable, ``len(ds) >= 2``, non-empty start/end segmentations)
+        # so the single random video pick never lands on a skipped sequence.
+        # Mirrors the pattern used in ``_stereomis_validation_epoch``.
+        eligible_names: List[str] = []
+        for seq_name in val_seqs:
+            try:
+                ds_try = STIRTracking(
+                    root=root, sequence=seq_name, height=height, width=width,
+                    start=0, stop=stir_stop, step=1,
+                )
+            except (FileNotFoundError, RuntimeError, OSError):
+                continue
+            if (
+                len(ds_try) >= 2
+                and ds_try.start_points.numel() > 0
+                and ds_try.end_points_orig.numel() > 0
+            ):
+                eligible_names.append(seq_name)
+        video_seq = rng.choice(eligible_names) if eligible_names else None
 
         self.temporal_tracker.eval()
         per_seq_rows: List[List[Any]] = []
@@ -3108,7 +3236,10 @@ class Engine:
         for seq_name in val_seqs:
             safe = str(seq_name).replace("/", "_").replace(os.sep, "_")
             try:
-                ds = STIRTracking(root=root, sequence=seq_name, height=height, width=width)
+                ds = STIRTracking(
+                    root=root, sequence=seq_name, height=height, width=width,
+                    start=0, stop=stir_stop, step=1,
+                )
             except (FileNotFoundError, RuntimeError, OSError) as e:
                 self.logger.warning(f"STIR val skip {seq_name}: {e}", context="TRACKING")
                 continue
@@ -3137,6 +3268,12 @@ class Engine:
                     **self._track_long_sequence_infer_kwargs(),
                 )
             pred_tracks = gt_out["tracks"].squeeze(0)  # [N_start, T, 2] in processing px
+            pred_vis_logits_stir = gt_out.get("visibility", None)
+            pred_vis_stir: torch.Tensor | None = None
+            if pred_vis_logits_stir is not None:
+                pred_vis_stir = (
+                    torch.sigmoid(pred_vis_logits_stir.squeeze(0)) > 0.5
+                ).cpu()  # [N_start, T]
 
             # Scale predicted endpoints back to native STIR resolution so the
             # [4, 8, 16, 32, 64] px thresholds match the STIRMetrics protocol.
@@ -3205,6 +3342,7 @@ class Engine:
                         fps=max(fps, 4),
                         trail_length=max(5, fps),
                         point_radius=3,
+                        visibility=pred_vis_stir,
                     )
                     render_comparison_video(
                         dataset=ds,
@@ -3215,6 +3353,7 @@ class Engine:
                         trail_length=max(5, fps),
                         point_radius=3,
                         visibility=gt_vis,
+                        pred_visibility=pred_vis_stir,
                         errors=pred_errors,
                         gate_prediction_on_gt_vis=False,
                     )
@@ -3374,6 +3513,7 @@ class Engine:
         with torch.no_grad():
             out = self.temporal_tracker.track(qp.unsqueeze(0), frames_in)
         pred = out["tracks"]
+        pred_vis_logits = out.get("visibility")  # [1, Q, T]
         mean_l2 = masked_mean_l2_px(pred, tracks_gt, comp > 0.5)
 
         out_dir = os.path.join(self.RUN_DIR, "tracking_val")
@@ -3381,7 +3521,10 @@ class Engine:
         vid_path = os.path.join(out_dir, f"pseudo_novelview_ep{epoch:04d}.mp4")
         tr_g = tracks_gt.squeeze(0).permute(1, 0, 2).cpu()
         tr_p = pred.squeeze(0).permute(1, 0, 2).cpu()
-        vis_draw = vis_gt.squeeze(0).cpu() > 0.5
+        vis_draw = vis_gt.squeeze(0).cpu() > 0.5  # [Q, T]
+        pred_vis_qt = None
+        if pred_vis_logits is not None:
+            pred_vis_qt = (torch.sigmoid(pred_vis_logits.squeeze(0)).cpu() > 0.5)
         try:
             write_pseudo_gt_vs_pred_video(
                 frames_in.detach().cpu(),
@@ -3391,6 +3534,7 @@ class Engine:
                 vid_path,
                 fps=8,
                 trail_length=min(8, T),
+                predicted_visibility_qt=pred_vis_qt,
             )
         except Exception as e:
             self.logger.warning(f"pseudo novelview video: {e}", context="TRACKING")
