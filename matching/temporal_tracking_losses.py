@@ -267,8 +267,18 @@ def compute_temporal_tracking_losses(
     Returns:
         dict with ``loss_total`` (differentiable scalar) and ``metrics`` sub-dict.
     """
-    w_cycle = float(config.get("TEMPORAL_CYCLE_LOSS_WEIGHT", 1.0))
-    w_smooth = float(config.get("TEMPORAL_SMOOTHNESS_LOSS_WEIGHT", 0.3))
+    w_cycle = float(
+        config.get(
+            "_SCHED_CYCLE_LOSS_WEIGHT",
+            config.get("TEMPORAL_CYCLE_LOSS_WEIGHT", 1.0),
+        )
+    )
+    w_smooth = float(
+        config.get(
+            "_SCHED_SMOOTHNESS_LOSS_WEIGHT",
+            config.get("TEMPORAL_SMOOTHNESS_LOSS_WEIGHT", 0.3),
+        )
+    )
     w_desc = float(config.get("TEMPORAL_DESC_LOSS_WEIGHT", 0.5))
     w_feat = float(config.get("TEMPORAL_FEATURE_LOSS_WEIGHT", 0.5))
     w_vis = float(config.get("TEMPORAL_VIS_REG_WEIGHT", 0.1))

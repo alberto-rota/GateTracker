@@ -70,8 +70,35 @@ def ddp_find_unused_parameters(config: Any) -> bool:
     every parameter participates in the forward pass. Set
     ``DDP_FIND_UNUSED_PARAMETERS: true`` in YAML if a branch sometimes skips
     subgraphs (e.g. optional heads).
+
+    Mutually exclusive with ``DDP_STATIC_GRAPH``: if the latter is on, PyTorch
+    requires ``find_unused_parameters=False`` and discovers unused params from
+    the first forward/backward automatically.
     """
+    if ddp_static_graph(config):
+        return False
     v = _cfg_get(config, "DDP_FIND_UNUSED_PARAMETERS", False)
+    if isinstance(v, bool):
+        return v
+    s = str(v).strip().lower()
+    return s in ("true", "1", "yes")
+
+
+def ddp_static_graph(config: Any) -> bool:
+    """``DistributedDataParallel(static_graph=...)``.
+
+    Set ``DDP_STATIC_GRAPH: true`` in YAML when the module graph is identical
+    every iteration (same used/unused param set, same control flow). Required
+    for modules that invoke a shared sub-module multiple times per forward
+    (e.g. ``MatcherModel._encode_image`` runs for both source and target so
+    every parameter in the encoder is visited twice); otherwise DDP raises
+    ``Expected to mark a variable ready only once`` under
+    ``find_unused_parameters=True``. Enabling this also covers the
+    unused-parameters case (depth backbone / depth predictor / frozen-backbone
+    in pretrain) without the extra autograd traversal of
+    ``find_unused_parameters=True``.
+    """
+    v = _cfg_get(config, "DDP_STATIC_GRAPH", False)
     if isinstance(v, bool):
         return v
     s = str(v).strip().lower()

@@ -815,8 +815,18 @@ def compute_temporal_tracking_losses(
         dict with ``loss_total`` (differentiable scalar) and ``metrics`` (detached
         per-term scalars; the blended total is logged separately as ``Loss``).
     """
-    w_cycle = float(config.get("TEMPORAL_CYCLE_LOSS_WEIGHT", 1.0)) * float(cycle_weight_scale)
-    w_smooth = float(config.get("TEMPORAL_SMOOTHNESS_LOSS_WEIGHT", 0.3))
+    w_cycle = float(
+        config.get(
+            "_SCHED_CYCLE_LOSS_WEIGHT",
+            config.get("TEMPORAL_CYCLE_LOSS_WEIGHT", 1.0),
+        )
+    ) * float(cycle_weight_scale)
+    w_smooth = float(
+        config.get(
+            "_SCHED_SMOOTHNESS_LOSS_WEIGHT",
+            config.get("TEMPORAL_SMOOTHNESS_LOSS_WEIGHT", 0.3),
+        )
+    )
     w_vel = float(config.get("TEMPORAL_VELOCITY_HUBER_WEIGHT", 0.0))
     vel_beta = float(config.get("TEMPORAL_VELOCITY_HUBER_BETA", 4.0))
     w_desc = float(config.get("TEMPORAL_DESC_LOSS_WEIGHT", 0.5))

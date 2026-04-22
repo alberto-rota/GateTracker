@@ -27,7 +27,7 @@ parameters:
   IMAGE_WIDTH:
     value: 448
   BATCH_SIZE:
-    value: 16
+    value: 8
   # singlegpu | dp | ddp (CLI ``--ddp`` / ``--dp`` / ``--single`` overrides this)
   DISTRIBUTE:
     value: "singlegpu"
@@ -35,6 +35,11 @@ parameters:
     value: "nccl"
   # DDP only: set true if forward sometimes skips parameters (optional heads).
   DDP_FIND_UNUSED_PARAMETERS:
+    value: false
+  # DDP only: static-graph mode. Disabled while ``GATE_FREEZE_EPOCHS`` > 0 so
+  # gate sub-modules can transition from ``grad=None`` to receiving gradients
+  # mid-run without ``static_graph=True`` baking the used/unused set at iter 1.
+  DDP_STATIC_GRAPH:
     value: false
   DDP_SHUFFLE_SEED:
     value: 978654321
@@ -44,7 +49,7 @@ parameters:
     value: 8
   PIN_MEMORY:
     value: True
-  PREFETCH_FACTOR:
+  PREFETCH_FACTOR:  
     value: 1
   FEWFRAMES:
     value: False
@@ -64,7 +69,7 @@ parameters:
         CURRICULUM_FACTOR: 1
         AUGMENTATION_PROBABILITY: {
           COLOR: 0.8,
-          GEOMETRIC: 0.0,
+          GEOMETRIC: 0.5,
           REVERSE: 0.0,
           STANDSTILL: 0.0
         }
@@ -100,15 +105,15 @@ parameters:
   FUSION_GATE_TEMPERATURE:
     value: 2.0
   FUSION_GATE_TEMPERATURE_FINAL:
-    value: 0.5
+    value: 1.0
   FUSION_GATE_ANNEAL_EPOCHS:
-    value: 10
+    value: 30
   FUSION_UNIFORM_MIXING:
-    value: 0.0
+    value: 0.1
   FUSION_LAYER_DROPOUT:
-    value: 0.10
+    value: 0.35
   FUSION_GATE_LOGIT_BOUND:
-    value: 8.0
+    value: 2.0
 
   # ===== MATCHING =====
   TRIPLETS_TO_MINE:
@@ -168,21 +173,20 @@ parameters:
   INFONCE_SYMMETRIC:
     value: True
   FINE_REFINEMENT_LOSS_WEIGHT:
-    value: 0.25
+    value: 0.10
   FINE_REFINEMENT_LOSS_BETA:
     value: 1.0
   # Entropy-minimization regularizer on fusion gate weights to encourage
-  # layer specialization. 0.0 disables the term. Raised from 0.05 to 0.15
-  # to force flatter, more transferable gate distributions and reduce the
-  # train/val gap on ``effective_layer``.
+  # layer specialization. 0.0 disables the term.
   GATE_ENTROPY_WEIGHT:
-    value: 0.15
+    value: 0.20
   # Freeze gate sub-modules (``local_gates``, ``register_gates``) for the
   # first ``GATE_FREEZE_EPOCHS`` training epochs, forcing descriptors and
   # refinement to work across all DINOv3 layers with a near-uniform gate
-  # before the gate is allowed to specialize. ``0`` disables freezing.
+  # before the gate is allowed to specialize. ``0`` disables freezing so
+  # the gate learns jointly with the descriptor/refinement heads from step 0.
   GATE_FREEZE_EPOCHS:
-    value: 10
+    value: 3
   LOSS_WEIGHT:
     value: {
       Fundamental: 0.8
@@ -194,7 +198,7 @@ parameters:
 
   # ===== OPTIMIZATION =====
   OPTIMIZER:
-    value: "Adam"
+    value: "AdamW"
   LEARNING_RATE:
     value: 1.0e-4
   LR_FUSION:
@@ -207,17 +211,23 @@ parameters:
     value: 5.0e-4
   # Nonzero decay is standard for ViT-based setups with a trainable backbone.
   WEIGHT_DECAY:
-    value: 1.0e-4
+    value: 1.0e-3
+  # Global max-norm for ``clip_grad_norm_`` in the matching optimization step.
+  # Keeps explicit even though 1.0 was previously hardcoded, so sweeps can
+  # override it without touching the engine code.
+  GRAD_CLIP_NORM:
+    value: 1.0
   GRADIENT_ACCUMULATION_STEPS:
     value: 1
   EPOCHS:
-    value: 200
+    value: 80
+  # Linear LR warmup length (in optimizer steps). Non-zero warmup stabilizes
+  # the first pass through the ViT backbone + fusion gate under Adam with the
+  # higher WEIGHT_DECAY, and dovetails with the cosine schedule below.
   WARMUP_STEPS:
-    value: 0
-  # TODO: drop to 25 once the unified ``Loss == EpipolarError`` signal has
-  # stabilized in wandb and the val curve is visibly smoother.
+    value: 500
   EARLYSTOPPING_PATIENCE:
-    value: 50
+    value: 15
   LR_SCHEDULER:
     value: "cosine"
   COSINESCHEDULER_NPERIODS:

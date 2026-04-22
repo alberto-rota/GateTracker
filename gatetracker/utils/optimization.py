@@ -10,7 +10,10 @@ from gatetracker.utils.logger import get_logger
 from typing import Any, Dict, Optional, List, Union, Tuple
 
 logger = get_logger(__name__).set_context("OPTIMIZATION")
-    
+
+# Default ``max_norm`` for temporal-refinement ``clip_grad_norm_`` when
+# ``TRACKING_GRAD_CLIP_MAX_NORM`` is absent from the run config.
+GRAD_CLIP_MAX_NORM: float = 5.0
 
 warnings.filterwarnings(
     "ignore", message="Your application has authenticated using end user credentials"

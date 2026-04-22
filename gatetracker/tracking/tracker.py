@@ -782,7 +782,10 @@ class TemporalTracker(nn.Module):
         device = frames.device
 
         lam_max = float(config.get("PSEUDO_GT_SUP_LAMBDA_MAX", 0.0))
-        mix = float(config.get("PSEUDO_GT_MIX", 0.0))
+        # Per-epoch mix from engine (``_SCHED_PSEUDO_GT_MIX``); falls back to static PSEUDO_GT_MIX.
+        mix = float(
+            config.get("_SCHED_PSEUDO_GT_MIX", config.get("PSEUDO_GT_MIX", 0.0))
+        )
         use_pseudo = (
             lam_max > 0.0
             and mix > 0.0

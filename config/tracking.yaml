@@ -37,6 +37,12 @@ parameters:
   # DDP only: set true if forward sometimes skips parameters (optional heads).
   DDP_FIND_UNUSED_PARAMETERS:
     value: false
+  # DDP only: enable when the module graph is identical every iteration
+  # (same used/unused params, same control flow). Needed whenever any
+  # sub-module is invoked multiple times per forward (e.g. MatcherModel
+  # encodes source + target through the same encoder).
+  DDP_STATIC_GRAPH:
+    value: true
   DDP_SHUFFLE_SEED:
     value: 978654321
   SHUFFLE:
@@ -58,7 +64,7 @@ parameters:
         FPS: 32
         FRAMESKIP: [1, 2, 4, 8, 16, 24, 32]
         TRAIN_VIDEOS: ["train_*"]
-        VAL_VIDEOS: [""]
+        VAL_VIDEOS: ["test_v27","test_v32"]
         TEST_VIDEOS: ["test_*"]
         RANDOM_POSE_TRAINING: True
         RANDOM_POSE_RANGES: [2.5, 3.25]
@@ -75,9 +81,9 @@ parameters:
         PATH: "CHOLEC80/videos"
         FPS: 80
         FRAMESKIP: [1]
-        TRAIN_VIDEOS: ["train_video*"]
+        TRAIN_VIDEOS: ["train_video01","train_video10","train_video20","train_video30","train_video40","train_video50","train_video60"]
         TEST_VIDEOS: [""]
-        VAL_VIDEOS: ["test_video*"]
+        VAL_VIDEOS: [""]
         RANDOM_POSE_TRAINING: True
         RANDOM_POSE_RANGES: [2.5, 3.25]
         CURRICULUM_FACTOR: 1
@@ -95,7 +101,7 @@ parameters:
         FRAMESKIP: [1, 2]
         TRAIN_VAL_SPLIT: 0.7
         TRAIN_VIDEOS: [""]
-        VAL_VIDEOS: ["test_P3_1"]
+        VAL_VIDEOS: ["test_*"]
         TEST_VIDEOS: ["test_P3_1"]
         RANDOM_POSE_TRAINING: True
         RANDOM_POSE_RANGES: [2.5, 3.25]
@@ -222,7 +228,7 @@ parameters:
 
   # ===== OPTIMIZATION =====
   OPTIMIZER:
-    value: "Adam"
+    value: "AdamW"
   LEARNING_RATE:
     value: 1.0e-5
   LR_FUSION:
@@ -234,13 +240,13 @@ parameters:
   LR_GATE:
     value: 5.0e-5
   WEIGHT_DECAY:
-    value: 0.0
+    value: 1.0e-4
   GRADIENT_ACCUMULATION_STEPS:
     value: 1
   EPOCHS:
-    value: 50
+    value: 100
   WARMUP_STEPS:
-    value: 0
+    value: 2000
   EARLYSTOPPING_PATIENCE:
     value: 50
   LR_SCHEDULER:
@@ -281,12 +287,12 @@ parameters:
   # sliding windows anchored to the **original** query descriptor, so test-
   # time horizon is not bounded by ``TRACKING_SEQUENCE_LENGTH``.
   TRACKING_BATCH_SIZE:
-    value: 4
+    value: 8
   # Longer train-time window (was 32) → more supervision for long-horizon
   # drift; combined with chained super-windows (``PSEUDO_GT_LONG_LENGTH``)
   # this gives direct supervision up to ~2-3 x this value per batch.
   TRACKING_SEQUENCE_LENGTH:
-    value: 32
+    value: 24
   TRACKING_NUM_QUERY_POINTS:
     value: 128
   TRACKING_WORKERS:
@@ -335,7 +341,7 @@ parameters:
   # Probability per iteration of training on a chained super-window. Requires
   # ``PSEUDO_GT_LONG_LENGTH > TRACKING_SEQUENCE_LENGTH``.
   TRACKING_LONGSEQ_TRAIN_PROB:
-    value: 0.5
+    value: 0.3
 
   # ===== TEMPORAL REFINEMENT NETWORK (architecture) =====
   # Sized for long-horizon reasoning: a 9x9 local correlation window
@@ -370,14 +376,24 @@ parameters:
   # / fine feature. With the anchor bank now providing several templates per
   # query they can be softer (was 0.75), which also lets the tracker survive
   # long-horizon photometric drift without being punished for it.
+  # --- Cycle loss: down-weight for the first few epochs (ramp to FINAL over RAMP_EPOCHS)
   TEMPORAL_CYCLE_LOSS_WEIGHT:
-    value: 1.0
+    value: 0.25
+  TEMPORAL_CYCLE_LOSS_WEIGHT_FINAL:
+    value: 2.0
+  TEMPORAL_CYCLE_LOSS_RAMP_EPOCHS:
+    value: 5
+  # --- Smoothness loss: down-weight early (ramp to FINAL over RAMP_EPOCHS)
   TEMPORAL_SMOOTHNESS_LOSS_WEIGHT:
-    value: 0.5
+    value: 0.1
+  TEMPORAL_SMOOTHNESS_LOSS_WEIGHT_FINAL:
+    value: 0.2
+  TEMPORAL_SMOOTHNESS_LOSS_RAMP_EPOCHS:
+    value: 5
   # First-order Huber on ||p_{t+1}-p_t|| (pixels); damps brief outlier jumps that
   # second-order smoothness can miss when visibility weights are high.
   TEMPORAL_VELOCITY_HUBER_WEIGHT:
-    value: 0.22
+    value: 0.05
   TEMPORAL_VELOCITY_HUBER_BETA:
     value: 6.0
   TEMPORAL_DESC_LOSS_WEIGHT:
@@ -405,7 +421,11 @@ parameters:
   LR_TEMPORAL_REFINEMENT:
     value: 2.0e-4
   LR_TEMPORAL_REFINEMENT_MIN:
-    value: 2.0e-6
+    value: 1.0e-5
+  # ``clip_grad_norm_`` on ``refinement_net`` (see ``gatetracker/engine.py``).
+  # Code default was 5.0 when this key is omitted.
+  TRACKING_GRAD_CLIP_MAX_NORM:
+    value: 1.0
 
   # ===== STEREOMIS / STIR / PSEUDO VAL (PHASE=tracking, each val epoch) =====
   # StereoMIS: metrics on all VAL_VIDEOS matches; W&B videos for one random seq/epoch.
@@ -422,7 +442,7 @@ parameters:
   TRACKING_VAL_RENDER_VIDEOS_ALL_SEQS:
     value: False
   TRACKING_STIR_VAL:
-    value: True
+    value: False  # disabled: STIR val triggered OOM after StereoMIS val (full-clip float32 load)
   TRACKING_STIR_TEST_MAX_FRAMES:
     value: null
   # One forced novel-view pseudo clip + sparse GT vs pred video (main rank only).
@@ -438,15 +458,20 @@ parameters:
     value: 0
 
   # ===== PSEUDO-GT (novel-view) supervision for PHASE=tracking =====
-  # Hybrid training: per-step Bernoulli(PSEUDO_GT_MIX) replaces the window with pseudo
-  # views; supervised weight ramps to PSEUDO_GT_SUP_LAMBDA_MAX over PSEUDO_GT_CURRICULUM_EPOCHS.
+  # Hybrid training: per-step Bernoulli(pseudo_gt_mix_now) replaces the window with pseudo
+  # views; mix_now ramps from PSEUDO_GT_MIX -> PSEUDO_GT_MIX_MIN over PSEUDO_GT_MIX_RAMP_EPOCHS.
+  # supervised weight ramps to PSEUDO_GT_SUP_LAMBDA_MAX over PSEUDO_GT_CURRICULUM_EPOCHS.
   # Pseudo-GT is currently the **only** signal that supervises long-horizon
   # absolute positions (cycle/smoothness/desc losses are local), so it is
   # weighted significantly stronger than the descriptor-pretrain default.
   PSEUDO_GT_MIX:
+    value: 1.0
+  PSEUDO_GT_MIX_MIN:
     value: 0.8
+  PSEUDO_GT_MIX_RAMP_EPOCHS:
+    value: 5
   PSEUDO_GT_SUP_LAMBDA_MAX:
-    value: 0.7
+    value: 0.5
   PSEUDO_GT_CURRICULUM_EPOCHS:
     value: 10
   # Chained super-window length (in frames). When ``TRACKING_LONGSEQ_TRAIN_PROB``
@@ -469,13 +494,13 @@ parameters:
   # it grows to ``PSEUDO_GT_LONG_LENGTH``. Any ``n_frames`` key in this block is ignored.
   PSEUDO_GT_TRAJECTORY:
     value:
-      z_bias_range: [-0.05, 0.05]
-      complexity_range: [0.3, 0.7]
+      z_bias_range: [-0.02, 0.02]
+      complexity_range: [0.0, 0.2]
       translation_range: [0.02, 0.08]
       rotation_range_deg: [2.0, 8.0]
-      forward_bias_range: [0.005, 0.02]
+      forward_bias_range: [0.002, 0.008]
       speed_scale_range: [0.5, 1.5]
-      still_fraction_range: [0.0, 0.15]
+      still_fraction_range: [0.0, 0.5]
       # Hard lower bound on camera-to-cloud clearance as a fraction of the
       # scene's nearest-point distance.  If the sampled trajectory would
       # ever breach this bound the translations are globally rescaled so the
@@ -514,11 +539,11 @@ parameters:
   # by setting ``n_range: [0, 0]`` (or removing the block entirely).
   PSEUDO_GT_OCCLUDERS:
     value:
-      n_range: [2, 5]
-      size_frac_range: [0.05, 0.15]
+      n_range: [0,0]
+      size_frac_range: [0.08, 0.25]
       motion_frac_range: [0.0, 0.5]
       sinusoid_frac_range: [0.0, 0.05]
-      lifetime_frac_range: [0.15, 0.7]
+      lifetime_frac_range: [0.3, 0.9]
       # Domain-aware colour: sample each sprite's base RGB from a random
       # patch of the source image so occluders stay inside the endoscopic
       # colour manifold (no out-of-domain blue occluders on red tissue).
@@ -543,7 +568,7 @@ parameters:
   # ones, so they contribute with a smaller weight (``0`` disables
   # position supervision on occluded frames, ``1`` treats them equally).
   TEMPORAL_SUP_POS_OCC_WEIGHT:
-    value: 0.5
+    value: 2.0
   TEMPORAL_SUP_VIS_WEIGHT:
     value: 3.0
   # Extra weight on BCE for occluded (target 0) frames vs visible frames.
@@ -553,7 +578,7 @@ parameters:
   # (vis_gt transitions 0 -> 1). Directly rewards occlusion recovery.
   # ``0`` disables the bump.
   TEMPORAL_SUP_POS_REAPPEAR_WEIGHT:
-    value: 3.0
+    value: 5.0
   TEMPORAL_SUP_HUBER_BETA:
     value: 1.0
   # --- Visualization knob -----------------------------------------------

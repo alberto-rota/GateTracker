@@ -4,10 +4,6 @@ import os
 import sys
 from pathlib import Path
 
-from InquirerPy import inquirer
-from InquirerPy.base.control import Choice
-from InquirerPy.utils import get_style
-
 
 def _list_yaml_configs(config_dir):
     root = Path(config_dir)
@@ -23,6 +19,8 @@ def _list_yaml_configs(config_dir):
 
 def _gatekeeper_style():
     """Dark palette similar to modern agent CLIs (subtle frame, soft violet accents)."""
+    from InquirerPy.utils import get_style
+
     return get_style(
         {
             "questionmark": "#52525b",
@@ -45,6 +43,16 @@ def _gatekeeper_style():
 
 def _pick_config_fuzzy(files, purpose, config_dir):
     """InquirerPy fuzzy prompt: type-to-filter, bordered list, fzf-like."""
+    try:
+        from InquirerPy import inquirer
+        from InquirerPy.base.control import Choice
+    except ImportError as e:
+        raise ImportError(
+            "Interactive config selection requires InquirerPy. "
+            "Install with: pip install InquirerPy\n"
+            "Or pass -c / --config with a path to your YAML (e.g. -c tracking.yaml)."
+        ) from e
+
     folder_hint = Path(config_dir).name
     choices = [
         Choice(

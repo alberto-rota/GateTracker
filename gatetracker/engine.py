@@ -39,10 +39,12 @@ from gatetracker.utils.training_phase import (
     normalize_pipeline_phase,
     pairwise_tracking_enabled,
 )
+from gatetracker.utils.schedules import _linear_ramp
 from gatetracker.distributed_context import (
     all_reduce_sum_scalars,
     barrier,
     ddp_find_unused_parameters,
+    ddp_static_graph,
     is_ddp_enabled,
     is_main_process,
     ShardedListSampler,
@@ -156,6 +158,16 @@ class Engine:
         )
         # Monotonic W&B x-axis for ``run_tests`` / eval media (``step/test_eval``).
         self._wandb_test_eval_step = 0
+        self.current_epoch = 0
+        self.global_step = 0
+
+        # Hierarchical-fusion gate freeze state (see ``_apply_gate_freeze``).
+        # Gate params keep ``requires_grad=True`` so the DDP autograd graph is
+        # stable under ``static_graph=True``; during the freeze window we simply
+        # drop their gradients before ``optimizer.step()`` so no weight updates
+        # occur. Matches the pre-fix semantics while preserving static-graph.
+        self._gate_freeze_active: bool = False
+        self._gate_freeze_params: List[torch.nn.Parameter] = []
 
         self.refinement_metric_names = {
             "RefinementActiveFraction",
@@ -180,6 +192,7 @@ class Engine:
                 device_ids=[lr],
                 output_device=lr,
                 find_unused_parameters=ddp_find_unused_parameters(self.config),
+                static_graph=ddp_static_graph(self.config),
             )
         elif is_dp_enabled(self.config):
             if self.device.type == "cuda" and torch.cuda.device_count() > 1:
@@ -332,30 +345,54 @@ class Engine:
         ``GATE_FREEZE_EPOCHS`` training epochs.
 
         During the freeze window, ``local_gates`` and ``register_gates``
-        parameters have ``requires_grad = False`` so descriptors and refinement
-        are forced to work across all DINOv3 layers with a near-uniform gate
+        behave as if frozen (no weight updates), forcing descriptors and
+        refinement to work across all DINOv3 layers with a near-uniform gate
         (after the register-gate zero-init + tanh clamp in ``fusion.py``).
-        Once the epoch counter crosses the threshold, gate parameters become
-        trainable again so the gate can specialize under the entropy regularizer.
+        Once the epoch counter crosses the threshold, gate parameters start
+        updating under the entropy regularizer.
 
-        A value of ``0`` (default when the key is absent from the config) is a
-        no-op for every epoch, preserving backward compatibility with existing
-        checkpoints / configs.
+        Implementation: we keep ``requires_grad = True`` on the gate
+        parameters at all times, and instead drop their gradients
+        (``p.grad = None``) in ``backward_pass`` while the freeze window is
+        active. This is functionally equivalent to ``requires_grad = False``
+        in terms of weight updates (all PyTorch optimizers skip params whose
+        ``.grad`` is ``None``), but keeps the set of grad-producing
+        parameters constant across iterations, which is required by
+        ``DistributedDataParallel(static_graph=True)``. Toggling
+        ``requires_grad`` at the freeze boundary instead would change the
+        parameters that participate in the DDP reducer and trigger
+        ``RuntimeError: Your training graph has changed in this iteration``
+        on the first batch after the transition.
+
+        A ``GATE_FREEZE_EPOCHS`` value of ``0`` (default when the key is
+        absent from the config) is a no-op for every epoch, preserving
+        backward compatibility with existing checkpoints / configs.
         """
         gate_freeze_epochs = int(self.config.get("GATE_FREEZE_EPOCHS", 0))
         if gate_freeze_epochs <= 0:
+            self._gate_freeze_active = False
+            self._gate_freeze_params = []
             return
         model = unwrap_model(self.matcher.model)
         fusion = getattr(model, "hierarchical_fusion", None)
         if fusion is None:
+            self._gate_freeze_active = False
+            self._gate_freeze_params = []
             return
-        should_train = epoch >= gate_freeze_epochs
+
+        gate_params: List[torch.nn.Parameter] = []
         for gate_list_name in ("local_gates", "register_gates"):
             gate_list = getattr(fusion, gate_list_name, None)
             if gate_list is None:
                 continue
             for param in gate_list.parameters():
-                param.requires_grad_(should_train)
+                # Keep requires_grad=True for a stable DDP static graph; the
+                # freeze is enforced via grad-masking in ``backward_pass``.
+                param.requires_grad_(True)
+                gate_params.append(param)
+
+        self._gate_freeze_active = epoch < gate_freeze_epochs
+        self._gate_freeze_params = gate_params
 
     def _compute_gate_entropy_loss(
         self,
@@ -539,6 +576,7 @@ class Engine:
         TEST = PHASE == "Test"
         if epoch is None:
             epoch = self.step["idx" if TEST else "epoch"]
+        self.current_epoch = int(epoch)
         if TRAINING:
             self.matcher.model.train()
         else:
@@ -587,6 +625,7 @@ class Engine:
         with self.choose_if_grad(PHASE):
             for batch_idx, sample in enumerate(dataloader):
                 step = epoch * len(dataloader) + batch_idx
+                self.global_step = int(step)
                 self.step[f"{PHASE}_batch"] += 1
 
                 log_images_this_batch = (
@@ -871,6 +910,15 @@ class Engine:
                     refinement_loss_value = None
                     refinement_active_matches = None
                     refinement_weight_mean = None
+                    if pairwise_tracking_enabled(self.config):
+                        tracking_result = compute_pairwise_tracking_losses(
+                            matching_pipeline=self.matcher,
+                            source_image=synthetic_framestack[:, 0],
+                            target_image=synthetic_framestack[:, -1],
+                            model_output=descriptors,
+                            config=self.config,
+                        )
+                        tracking_loss_value = tracking_result["loss_total"].detach().item()
                 torch.cuda.empty_cache()
 
                 metrics = self.matcher.compute_metrics(
@@ -1167,6 +1215,14 @@ class Engine:
             )
             ERROR_IN_BACKWARD_PASS = True
 
+        # Hierarchical-fusion gate freeze: drop grads on gate params during the
+        # freeze window so the optimizer (which skips params with ``grad is
+        # None``) leaves their weights untouched. The params stay
+        # ``requires_grad=True`` so DDP's static graph remains valid.
+        if self._gate_freeze_active and self._gate_freeze_params:
+            for p in self._gate_freeze_params:
+                p.grad = None
+
         grad_norm, weight_norm = optimization.get_grad_and_weight_norms(
             self.matcher.model.parameters()
         )
@@ -1176,8 +1232,9 @@ class Engine:
             )[0]
             for i, g in enumerate(self.optimizer.param_groups)
         }
+        grad_clip_max = float(self.config.get("GRAD_CLIP_NORM", 1.0))
         clipped_norm = torch.nn.utils.clip_grad_norm_(
-            self.matcher.model.parameters(), max_norm=1.0
+            self.matcher.model.parameters(), max_norm=grad_clip_max
         )
         clipped_norm_val = (
             clipped_norm.item() if torch.is_tensor(clipped_norm) else float(clipped_norm)
@@ -2524,6 +2581,7 @@ class Engine:
                 device_ids=[lr],
                 output_device=lr,
                 find_unused_parameters=ddp_find_unused_parameters(self.config),
+                static_graph=ddp_static_graph(self.config),
             )
 
         lr_temporal = float(
@@ -2532,7 +2590,9 @@ class Engine:
                 self.config.get("LEARNING_RATE", 1e-4),
             )
         )
-        self.tracking_optimizer = torch.optim.Adam(
+        tracking_opt_name = str(self.config.get("OPTIMIZER", "Adam"))
+        tracking_opt_cls = getattr(optimization, tracking_opt_name)
+        self.tracking_optimizer = tracking_opt_cls(
             self.temporal_tracker.refinement_net.parameters(),
             lr=lr_temporal,
             weight_decay=float(self.config.get("WEIGHT_DECAY", 0)),
@@ -2637,6 +2697,7 @@ class Engine:
             Status string.
         """
         TRAINING = phase == "Training"
+        self.current_epoch = int(epoch)
         seq_ds = self._tracking_datasets.get(phase)
         if seq_ds is None:
             # Still run StereoMIS GT / video eval on validation epochs so GT vs pred
@@ -2697,6 +2758,26 @@ class Engine:
                 self._tracking_validation_tracking_epoch(epoch)
             return "EMPTY"
 
+        cfg_sched = self.config
+        mix_start = float(cfg_sched.get("PSEUDO_GT_MIX", 0.8))
+        mix_end = float(cfg_sched.get("PSEUDO_GT_MIX_MIN", mix_start))
+        mix_ramp = int(cfg_sched.get("PSEUDO_GT_MIX_RAMP_EPOCHS", 0))
+        pseudo_gt_mix_now = _linear_ramp(epoch, mix_start, mix_end, mix_ramp)
+
+        cyc_s = float(cfg_sched.get("TEMPORAL_CYCLE_LOSS_WEIGHT", 1.0))
+        cyc_e = float(cfg_sched.get("TEMPORAL_CYCLE_LOSS_WEIGHT_FINAL", cyc_s))
+        cyc_r = int(cfg_sched.get("TEMPORAL_CYCLE_LOSS_RAMP_EPOCHS", 0))
+        cycle_w_now = _linear_ramp(epoch, cyc_s, cyc_e, cyc_r)
+
+        sm_s = float(cfg_sched.get("TEMPORAL_SMOOTHNESS_LOSS_WEIGHT", 0.5))
+        sm_e = float(cfg_sched.get("TEMPORAL_SMOOTHNESS_LOSS_WEIGHT_FINAL", sm_s))
+        sm_r = int(cfg_sched.get("TEMPORAL_SMOOTHNESS_LOSS_RAMP_EPOCHS", 0))
+        smooth_w_now = _linear_ramp(epoch, sm_s, sm_e, sm_r)
+
+        cfg_sched["_SCHED_PSEUDO_GT_MIX"] = pseudo_gt_mix_now
+        cfg_sched["_SCHED_CYCLE_LOSS_WEIGHT"] = cycle_w_now
+        cfg_sched["_SCHED_SMOOTHNESS_LOSS_WEIGHT"] = smooth_w_now
+
         num_query_pts = int(self.config.get("TRACKING_NUM_QUERY_POINTS", 64))
         epoch_losses = []
         # Epoch-level aggregates so W&B run summary is not the last-batch value
@@ -2711,12 +2792,27 @@ class Engine:
         }
         epoch_agg_count = 0
 
-        grad_clip_max = float(self.config.get("TRACKING_GRAD_CLIP_MAX_NORM", 1.0))
+        grad_clip_max = float(
+            self.config.get(
+                "TRACKING_GRAD_CLIP_MAX_NORM",
+                optimization.GRAD_CLIP_MAX_NORM,
+            )
+        )
 
         ctx = nullcontext() if TRAINING else torch.no_grad()
         with ctx:
             for batch_idx, batch in enumerate(dataloader):
+                if (
+                    TRAINING
+                    and os.environ.get("GATETRACKER_CRASH_TEST", "").lower()
+                    in ("1", "true")
+                    and int(batch_idx) == 0
+                    and int(epoch) == 0
+                ):
+                    raise RuntimeError("GATETRACKER_CRASH_TEST")
+
                 frames = batch["frames"].to(self.device)  # [B, T, 3, H, W]
+                self.global_step = int(epoch) * len(dataloader) + int(batch_idx)
 
                 loss_dict = self.temporal_tracker.training_step(
                     frames,
@@ -2728,48 +2824,83 @@ class Engine:
                 )
 
                 loss_total = loss_dict["loss_total"]
+                metrics_self_sup = loss_dict.get("metrics_self_sup", {}) or {}
+                metrics_pseudo_gt = loss_dict.get("metrics_pseudo_gt", {}) or {}
+                pga = float(metrics_pseudo_gt.get("pseudo_gt_active", 0.0))
+                self_sup_total_f = metrics_self_sup.get("loss_self_sup_total")
+                pseudo_sup_total_f = metrics_pseudo_gt.get("loss_sup_total")
 
                 grad_norm_val = 0.0
                 grad_norm_clipped_val = 0.0
                 weight_norm_val = 0.0
                 step_skipped = False
                 if TRAINING:
-                    if torch.isfinite(loss_total):
-                        loss_total.backward()
-                        params = list(
-                            self.temporal_tracker.refinement_net.parameters()
+                    if not torch.isfinite(loss_total):
+                        self.logger.warning(
+                            f"Non-finite total loss at epoch {epoch}, step {self.global_step}: "
+                            f"total={loss_total.item()}, "
+                            f"self_sup={self_sup_total_f}, "
+                            f"pseudo_sup={pseudo_sup_total_f}, "
+                            f"pseudo_gt_active={pga > 0.5}"
                         )
-                        grad_norm_val, weight_norm_val = (
-                            optimization.get_grad_and_weight_norms(params)
-                        )
-                        # clip_grad_norm_ returns the pre-clip total grad norm
-                        # (for backward compatibility with the matching loop's
-                        # convention, we log it as ``GradNormClipped`` → final
-                        # post-clip norm is min(grad_norm, max_norm)).
-                        pre_clip = torch.nn.utils.clip_grad_norm_(
-                            params,
-                            max_norm=grad_clip_max,
-                        )
-                        pre_clip_val = (
-                            float(pre_clip.detach().cpu())
-                            if isinstance(pre_clip, torch.Tensor)
-                            else float(pre_clip)
-                        )
-                        if not math.isfinite(pre_clip_val):
-                            # Non-finite grads → skip optimizer update.
-                            self.tracking_optimizer.zero_grad(set_to_none=True)
-                            step_skipped = True
-                        else:
-                            grad_norm_clipped_val = min(pre_clip_val, grad_clip_max)
-                            self.tracking_optimizer.step()
-                            self.tracking_optimizer.zero_grad(set_to_none=True)
-                    else:
+                        self.tracking_optimizer.zero_grad(set_to_none=True)
+                        if self.wandb is not None:
+                            self.wandb.log(
+                                {f"{phase}/tracking/optim/StepSkipped": 1},
+                                commit=False,
+                            )
+                        epoch_agg["n_steps_skipped"] += 1
+                        continue
+
+                    loss_total.backward()
+                    params = list(
+                        self.temporal_tracker.refinement_net.parameters()
+                    )
+                    grad_norm_val, weight_norm_val = (
+                        optimization.get_grad_and_weight_norms(params)
+                    )
+                    # clip_grad_norm_ returns the pre-clip total grad norm
+                    # (for backward compatibility with the matching loop's
+                    # convention, we log it as ``GradNormClipped`` → final
+                    # post-clip norm is min(grad_norm, max_norm)).
+                    pre_clip = torch.nn.utils.clip_grad_norm_(
+                        params,
+                        max_norm=grad_clip_max,
+                    )
+                    pre_clip_val = (
+                        float(pre_clip.detach().cpu())
+                        if isinstance(pre_clip, torch.Tensor)
+                        else float(pre_clip)
+                    )
+                    if not math.isfinite(pre_clip_val):
+                        # Non-finite grads → skip optimizer update.
                         self.tracking_optimizer.zero_grad(set_to_none=True)
                         step_skipped = True
+                    else:
+                        grad_norm_clipped_val = min(pre_clip_val, grad_clip_max)
+                        self.tracking_optimizer.step()
+                        self.tracking_optimizer.zero_grad(set_to_none=True)
 
                 metrics = self._tracking_step_metrics_for_log(phase, loss_dict)
                 metrics[f"Step/{'epoch' if phase == 'Training' else 'val_epoch'}"] = epoch
                 metrics["Loss"] = loss_total.item()
+                metrics["HyperParameters/pseudo_gt_mix_now"] = float(pseudo_gt_mix_now)
+                metrics["HyperParameters/cycle_loss_weight_now"] = float(cycle_w_now)
+                metrics["HyperParameters/smoothness_loss_weight_now"] = float(
+                    smooth_w_now
+                )
+                if pga > 0.5:
+                    metrics[f"{phase}/loss/Loss_pseudo"] = float(loss_total.item())
+                    if self_sup_total_f is not None:
+                        metrics[
+                            f"{phase}/tracking/self_sup/loss_self_sup_total_pseudo"
+                        ] = float(self_sup_total_f)
+                else:
+                    metrics[f"{phase}/loss/Loss_real"] = float(loss_total.item())
+                    if self_sup_total_f is not None:
+                        metrics[
+                            f"{phase}/tracking/self_sup/loss_self_sup_total_real"
+                        ] = float(self_sup_total_f)
                 metrics[f"{phase}/optim/LR_temporal"] = float(
                     self.tracking_optimizer.param_groups[0]["lr"]
                 )

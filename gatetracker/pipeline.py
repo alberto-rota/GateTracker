@@ -2,6 +2,8 @@
 
 import ast
 import sys
+import traceback
+from pathlib import Path
 
 import yaml
 
@@ -33,6 +35,64 @@ def _load_yaml_config(config_path):
         else:
             config_dict[key] = val
     return config_dict
+
+
+def _save_training_crash_state(engine, exc: Exception) -> None:
+    """Persist model/optim/scheduler + traceback for post-mortem when training crashes."""
+    import torch
+
+    from gatetracker.distributed_context import unwrap_model
+    from gatetracker.utils.logger import get_logger
+    from gatetracker.utils.training_phase import normalize_pipeline_phase
+
+    log = get_logger(__name__).set_context("MAIN")
+    crash_path = Path(engine.RUN_DIR) / "crash_state.pt"
+    phase = normalize_pipeline_phase(engine.config)
+
+    matcher_sd = unwrap_model(engine.matcher.model).state_dict()
+    refinement_sd = None
+    if getattr(engine, "temporal_tracker", None) is not None:
+        refinement_sd = unwrap_model(
+            engine.temporal_tracker.refinement_net,
+        ).state_dict()
+
+    if phase == "tracking":
+        optimizer = getattr(engine, "tracking_optimizer", None)
+        scheduler = getattr(engine, "tracking_lr_scheduler", None)
+    else:
+        optimizer = getattr(engine, "optimizer", None)
+        scheduler = getattr(engine, "LRscheduler", None) or getattr(
+            engine, "LRschedulerPlateau", None,
+        )
+
+    sched_sd = (
+        scheduler.state_dict()
+        if scheduler is not None and hasattr(scheduler, "state_dict")
+        else None
+    )
+
+    payload = {
+        "model_state": matcher_sd,
+        "refinement_state": refinement_sd,
+        "optimizer_state": optimizer.state_dict() if optimizer is not None else None,
+        "scheduler_state": sched_sd,
+        "epoch": int(
+            getattr(
+                engine,
+                "current_epoch",
+                engine.step.get("epoch", 0) if hasattr(engine, "step") else 0,
+            )
+        ),
+        "step": getattr(engine, "global_step", 0),
+        "traceback": traceback.format_exc(),
+        "exception_repr": repr(exc),
+    }
+    torch.save(payload, crash_path)
+    log.error(f"Training crashed; state saved to {crash_path}")
+
+    wb = getattr(engine, "wandb", None)
+    if wb is not None:
+        wb.save(str(crash_path))
 
 
 def run_pipeline(
@@ -148,7 +208,14 @@ def run_pipeline(
         engine = Engine(model=config.RUN, dataset=dataset, config=config)
 
         if mode == "train":
-            engine.trainloop()
+            try:
+                engine.trainloop()
+            except Exception as exc:
+                from gatetracker.distributed_context import is_main_process
+
+                if is_main_process():
+                    _save_training_crash_state(engine, exc)
+                raise
             engine.reinstantiate_model_from_checkpoint()
             engine.test()
         else:
