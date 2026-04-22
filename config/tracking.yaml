@@ -17,7 +17,7 @@ parameters:
   FROM_PRETRAINED_CHECKPOINT:
     value: ""
   PRETRAINED_DESCRIPTOR_CKPT:
-    value: "lilac-galaxy-57"
+    value: "lilac-water-89"
 
   # ===== DATA =====
   # Phase-aware splits (optional): PHASES lists which pipeline uses this dataset

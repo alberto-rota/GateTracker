@@ -220,7 +220,7 @@ parameters:
   GRADIENT_ACCUMULATION_STEPS:
     value: 1
   EPOCHS:
-    value: 80
+    value: 150
   # Linear LR warmup length (in optimizer steps). Non-zero warmup stabilizes
   # the first pass through the ViT backbone + fusion gate under Adam with the
   # higher WEIGHT_DECAY, and dovetails with the cosine schedule below.
@@ -231,7 +231,7 @@ parameters:
   LR_SCHEDULER:
     value: "cosine"
   COSINESCHEDULER_NPERIODS:
-    value: 0.5
+    value: 0.25
   STEPWISESCHEDULER_NSTEPS:
     value: 3
   STEPWISESCHEDULER_GAMMA:
