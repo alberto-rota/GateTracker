@@ -20,7 +20,7 @@ parameters:
     value: "lilac-water-89"
 
   # ===== DATA =====
-  # Phase-aware splits (optional): PHASES lists which pipeline uses this dataset
+  # Phase-aware splits (optional): PHASES lists which pipeline uses this datasetj
   # (pretrain | tracking). PRETRAIN / TRACKING blocks override TRAIN_VIDEOS /
   # VAL_VIDEOS / TEST_VIDEOS for that phase. MAX_*_VIDEOS caps list size after patterns.
   # STIR is eval-only (no Mono3D class): PHASES: [tracking], PATH, CAMERA, COLLECTION_GLOBS.
@@ -376,13 +376,21 @@ parameters:
   # / fine feature. With the anchor bank now providing several templates per
   # query they can be softer (was 0.75), which also lets the tracker survive
   # long-horizon photometric drift without being punished for it.
-  # --- Cycle loss: down-weight for the first few epochs (ramp to FINAL over RAMP_EPOCHS)
+  # --- Cycle loss: piecewise epoch ramp (takes precedence over WEIGHT / FINAL / RAMP_EPOCHS).
+  # Slow schedule: 0.25→0.35→0.5→0.65 with **two epochs** between knots (vs one-epoch-per-step).
+  TEMPORAL_CYCLE_LOSS_MILESTONES:
+    value:
+      - [0, 0.25]
+      - [2, 0.35]
+      - [4, 0.5]
+      - [6, 0.65]
+  # Fallback linear ramp if MILESTONES is removed or empty (start → end over RAMP_EPOCHS).
   TEMPORAL_CYCLE_LOSS_WEIGHT:
     value: 0.25
   TEMPORAL_CYCLE_LOSS_WEIGHT_FINAL:
-    value: 2.0
+    value: 0.65
   TEMPORAL_CYCLE_LOSS_RAMP_EPOCHS:
-    value: 5
+    value: 10
   # --- Smoothness loss: down-weight early (ramp to FINAL over RAMP_EPOCHS)
   TEMPORAL_SMOOTHNESS_LOSS_WEIGHT:
     value: 0.1
@@ -423,9 +431,16 @@ parameters:
   LR_TEMPORAL_REFINEMENT_MIN:
     value: 1.0e-5
   # ``clip_grad_norm_`` on ``refinement_net`` (see ``gatetracker/engine.py``).
-  # Code default was 5.0 when this key is omitted.
+  # Code default was 5.0 when this key is omitted. Logged ``GradNorm`` is **pre-clip**;
+  # if it stays huge while this is 1.0, raise cycle / pseudo weights before raising the clip.
   TRACKING_GRAD_CLIP_MAX_NORM:
     value: 1.0
+  # Linear LR warmup on the temporal optimizer for the first N scheduler steps
+  # (one step per epoch after validation), then cosine decay for the remainder.
+  TRACKING_LR_WARMUP_EPOCHS:
+    value: 1
+  TRACKING_LR_WARMUP_START_FACTOR:
+    value: 0.01
 
   # ===== STEREOMIS / STIR / PSEUDO VAL (PHASE=tracking, each val epoch) =====
   # StereoMIS: metrics on all VAL_VIDEOS matches; W&B videos for one random seq/epoch.
@@ -460,7 +475,11 @@ parameters:
   # ===== PSEUDO-GT (novel-view) supervision for PHASE=tracking =====
   # Hybrid training: per-step Bernoulli(pseudo_gt_mix_now) replaces the window with pseudo
   # views; mix_now ramps from PSEUDO_GT_MIX -> PSEUDO_GT_MIX_MIN over PSEUDO_GT_MIX_RAMP_EPOCHS.
-  # supervised weight ramps to PSEUDO_GT_SUP_LAMBDA_MAX over PSEUDO_GT_CURRICULUM_EPOCHS.
+  # Supervised blend ``lambda`` is scheduled in ``gatetracker/engine.py`` (``_SCHED_PSEUDO_SUP_LAMBDA``):
+  # ramps to PSEUDO_GT_SUP_LAMBDA_MAX over PSEUDO_GT_SUP_LAMBDA_RAMP_EPOCHS, capped at
+  # PSEUDO_GT_SUP_LAMBDA_CAP_UNTIL_CYCLE_RELEASE until mean training ``loss_cycle`` stays
+  # below PSEUDO_GT_CYCLE_LOSS_RELEASE_THRESH for PSEUDO_GT_CYCLE_LOSS_RELEASE_PATIENCE epochs
+  # (DDP all-reduced). If THRESH is null, use PSEUDO_GT_SUP_LAMBDA_PLATEAU_HOLD_EPOCHS only.
   # Pseudo-GT is currently the **only** signal that supervises long-horizon
   # absolute positions (cycle/smoothness/desc losses are local), so it is
   # weighted significantly stronger than the descriptor-pretrain default.
@@ -471,7 +490,17 @@ parameters:
   PSEUDO_GT_MIX_RAMP_EPOCHS:
     value: 5
   PSEUDO_GT_SUP_LAMBDA_MAX:
-    value: 0.5
+    value: 0.20
+  PSEUDO_GT_SUP_LAMBDA_RAMP_EPOCHS:
+    value: 25
+  PSEUDO_GT_SUP_LAMBDA_CAP_UNTIL_CYCLE_RELEASE:
+    value: 0.05
+  PSEUDO_GT_CYCLE_LOSS_RELEASE_THRESH:
+    value: 0.04
+  PSEUDO_GT_CYCLE_LOSS_RELEASE_PATIENCE:
+    value: 3
+  PSEUDO_GT_SUP_LAMBDA_PLATEAU_HOLD_EPOCHS:
+    value: 0
   PSEUDO_GT_CURRICULUM_EPOCHS:
     value: 10
   # Chained super-window length (in frames). When ``TRACKING_LONGSEQ_TRAIN_PROB``

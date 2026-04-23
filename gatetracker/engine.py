@@ -39,7 +39,7 @@ from gatetracker.utils.training_phase import (
     normalize_pipeline_phase,
     pairwise_tracking_enabled,
 )
-from gatetracker.utils.schedules import _linear_ramp
+from gatetracker.utils.schedules import _linear_ramp, _piecewise_linear_epochs
 from gatetracker.distributed_context import (
     all_reduce_sum_scalars,
     barrier,
@@ -2610,11 +2610,35 @@ class Engine:
                 lr_temporal * 1e-2,
             )
         )
-        self.tracking_lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.tracking_optimizer,
-            T_max=epochs,
-            eta_min=eta_min,
-        )
+        warmup_ep = max(0, int(self.config.get("TRACKING_LR_WARMUP_EPOCHS", 0)))
+        if warmup_ep > 0:
+            w_start = float(self.config.get("TRACKING_LR_WARMUP_START_FACTOR", 0.01))
+            warmup = torch.optim.lr_scheduler.LinearLR(
+                self.tracking_optimizer,
+                start_factor=w_start,
+                end_factor=1.0,
+                total_iters=warmup_ep,
+            )
+            cosine_T = max(1, epochs - warmup_ep)
+            cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.tracking_optimizer,
+                T_max=cosine_T,
+                eta_min=eta_min,
+            )
+            self.tracking_lr_scheduler = torch.optim.lr_scheduler.SequentialLR(
+                self.tracking_optimizer,
+                schedulers=[warmup, cosine],
+                milestones=[warmup_ep],
+            )
+        else:
+            self.tracking_lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.tracking_optimizer,
+                T_max=epochs,
+                eta_min=eta_min,
+            )
+
+        self._pseudo_cycle_released = False
+        self._pseudo_cycle_below_streak = 0
 
         # Must not use ``self.earlystopping`` here: that writes ``{runname}_checkpoint.pth``,
         # which ``fromArtifact`` / ``reinstantiate_model_from_checkpoint`` treat as the full
@@ -2685,6 +2709,64 @@ class Engine:
             )
             self.logger.info(f"Saved tracking refinement network: {tracking_ckpt_path}", context="SAVE")
         self.logger.info("TRACKING TRAINING COMPLETE", context="SAVE")
+
+    def _sched_cycle_loss_weight(self, epoch: int, cfg) -> float:
+        """Epoch schedule for cycle loss weight (piecewise milestones or linear ramp)."""
+        raw = cfg.get("TEMPORAL_CYCLE_LOSS_MILESTONES")
+        milestones = None
+        if raw is not None:
+            milestones = raw.get("value", raw) if isinstance(raw, dict) else raw
+        if milestones:
+            return _piecewise_linear_epochs(epoch, milestones)
+        cyc_s = float(cfg.get("TEMPORAL_CYCLE_LOSS_WEIGHT", 1.0))
+        cyc_e = float(cfg.get("TEMPORAL_CYCLE_LOSS_WEIGHT_FINAL", cyc_s))
+        cyc_r = int(cfg.get("TEMPORAL_CYCLE_LOSS_RAMP_EPOCHS", 0))
+        return _linear_ramp(epoch, cyc_s, cyc_e, cyc_r)
+
+    def _sched_pseudo_sup_lambda(self, epoch: int, cfg) -> float:
+        """Blend weight ``lambda`` for pseudo-GT supervised vs self-sup (decoupled from cycle ramp)."""
+        lam_max = float(cfg.get("PSEUDO_GT_SUP_LAMBDA_MAX", 0.0))
+        if lam_max <= 0.0:
+            return 0.0
+        ramp_ep = int(
+            cfg.get(
+                "PSEUDO_GT_SUP_LAMBDA_RAMP_EPOCHS",
+                cfg.get("PSEUDO_GT_CURRICULUM_EPOCHS", 10),
+            )
+        )
+        ramp_ep = max(1, ramp_ep)
+        lam_uncapped = lam_max * min(1.0, float(epoch + 1) / float(ramp_ep))
+        cap = float(cfg.get("PSEUDO_GT_SUP_LAMBDA_CAP_UNTIL_CYCLE_RELEASE", 0.05))
+        thresh = cfg.get("PSEUDO_GT_CYCLE_LOSS_RELEASE_THRESH", None)
+        hold_epochs = int(cfg.get("PSEUDO_GT_SUP_LAMBDA_PLATEAU_HOLD_EPOCHS", 0))
+        released = bool(getattr(self, "_pseudo_cycle_released", False))
+        if thresh is not None:
+            if not released:
+                return float(min(cap, lam_uncapped))
+            return float(lam_uncapped)
+        if hold_epochs > 0 and int(epoch) < hold_epochs:
+            return float(min(cap, lam_uncapped))
+        return float(lam_uncapped)
+
+    def _tracking_update_pseudo_lambda_release_gate(
+        self, mean_loss_cycle: float, cfg,
+    ) -> None:
+        """Advance loss-gated release for pseudo ``lambda`` (DDP-safe mean cycle loss)."""
+        thresh = cfg.get("PSEUDO_GT_CYCLE_LOSS_RELEASE_THRESH", None)
+        if thresh is None or getattr(self, "_pseudo_cycle_released", False):
+            return
+        thresh_f = float(thresh)
+        patience = max(1, int(cfg.get("PSEUDO_GT_CYCLE_LOSS_RELEASE_PATIENCE", 2)))
+        if not math.isfinite(mean_loss_cycle):
+            return
+        if mean_loss_cycle < thresh_f:
+            self._pseudo_cycle_below_streak = int(
+                getattr(self, "_pseudo_cycle_below_streak", 0),
+            ) + 1
+            if self._pseudo_cycle_below_streak >= patience:
+                self._pseudo_cycle_released = True
+        else:
+            self._pseudo_cycle_below_streak = 0
 
     def _run_tracking_epoch(self, phase: str = "Training", epoch: int = 0) -> str:
         """Execute one tracking training/validation epoch.
@@ -2764,10 +2846,7 @@ class Engine:
         mix_ramp = int(cfg_sched.get("PSEUDO_GT_MIX_RAMP_EPOCHS", 0))
         pseudo_gt_mix_now = _linear_ramp(epoch, mix_start, mix_end, mix_ramp)
 
-        cyc_s = float(cfg_sched.get("TEMPORAL_CYCLE_LOSS_WEIGHT", 1.0))
-        cyc_e = float(cfg_sched.get("TEMPORAL_CYCLE_LOSS_WEIGHT_FINAL", cyc_s))
-        cyc_r = int(cfg_sched.get("TEMPORAL_CYCLE_LOSS_RAMP_EPOCHS", 0))
-        cycle_w_now = _linear_ramp(epoch, cyc_s, cyc_e, cyc_r)
+        cycle_w_now = self._sched_cycle_loss_weight(int(epoch), cfg_sched)
 
         sm_s = float(cfg_sched.get("TEMPORAL_SMOOTHNESS_LOSS_WEIGHT", 0.5))
         sm_e = float(cfg_sched.get("TEMPORAL_SMOOTHNESS_LOSS_WEIGHT_FINAL", sm_s))
@@ -2777,6 +2856,9 @@ class Engine:
         cfg_sched["_SCHED_PSEUDO_GT_MIX"] = pseudo_gt_mix_now
         cfg_sched["_SCHED_CYCLE_LOSS_WEIGHT"] = cycle_w_now
         cfg_sched["_SCHED_SMOOTHNESS_LOSS_WEIGHT"] = smooth_w_now
+        cfg_sched["_SCHED_PSEUDO_SUP_LAMBDA"] = self._sched_pseudo_sup_lambda(
+            int(epoch), cfg_sched,
+        )
 
         num_query_pts = int(self.config.get("TRACKING_NUM_QUERY_POINTS", 64))
         epoch_losses = []
@@ -2789,6 +2871,8 @@ class Engine:
             "grad_norm": 0.0,
             "grad_norm_clipped": 0.0,
             "n_steps_skipped": 0,
+            "loss_cycle_sum": 0.0,
+            "loss_cycle_count": 0,
         }
         epoch_agg_count = 0
 
@@ -2889,6 +2973,12 @@ class Engine:
                 metrics["HyperParameters/smoothness_loss_weight_now"] = float(
                     smooth_w_now
                 )
+                metrics["HyperParameters/pseudo_sup_lambda_sched"] = float(
+                    cfg_sched.get("_SCHED_PSEUDO_SUP_LAMBDA", 0.0)
+                )
+                metrics["HyperParameters/pseudo_cycle_released"] = float(
+                    1.0 if getattr(self, "_pseudo_cycle_released", False) else 0.0
+                )
                 if pga > 0.5:
                     metrics[f"{phase}/loss/Loss_pseudo"] = float(loss_total.item())
                     if self_sup_total_f is not None:
@@ -2925,6 +3015,10 @@ class Engine:
                 epoch_agg["grad_norm"] += grad_norm_val
                 epoch_agg["grad_norm_clipped"] += grad_norm_clipped_val
                 epoch_agg["n_steps_skipped"] += int(step_skipped)
+                lc = loss_dict.get("metrics_self_sup", {}).get("loss_cycle", None)
+                if lc is not None and math.isfinite(float(lc)):
+                    epoch_agg["loss_cycle_sum"] += float(lc)
+                    epoch_agg["loss_cycle_count"] += 1
                 epoch_agg_count += 1
 
                 new_row = pd.DataFrame([metrics])
@@ -2943,6 +3037,14 @@ class Engine:
 
                 del frames, loss_dict, loss_total
                 torch.cuda.empty_cache()
+
+        if TRAINING and float(epoch_agg.get("loss_cycle_count", 0)) > 0:
+            lc_sum = float(epoch_agg["loss_cycle_sum"])
+            lc_cnt = float(epoch_agg["loss_cycle_count"])
+            if is_ddp_enabled(self.config):
+                lc_sum, lc_cnt = all_reduce_sum_scalars(lc_sum, lc_cnt, self.device)
+            mean_lc = lc_sum / max(lc_cnt, 1.0)
+            self._tracking_update_pseudo_lambda_release_gate(mean_lc, cfg_sched)
 
         # DDP collective BEFORE any rank-0-only work. If we synced AFTER
         # ``_tracking_validation_tracking_epoch`` (which only runs on rank 0

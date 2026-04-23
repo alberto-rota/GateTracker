@@ -1144,8 +1144,12 @@ class TemporalTracker(nn.Module):
                 position_mask=pos_mask_m,
                 vis_gt=vis_gt,
             )
-            cur_epochs = max(1, int(config.get("PSEUDO_GT_CURRICULUM_EPOCHS", 10)))
-            lam = lam_max * min(1.0, float(epoch + 1) / float(cur_epochs))
+            lam_sched = config.get("_SCHED_PSEUDO_SUP_LAMBDA", None)
+            if lam_sched is not None:
+                lam = float(lam_sched)
+            else:
+                cur_epochs = max(1, int(config.get("PSEUDO_GT_CURRICULUM_EPOCHS", 10)))
+                lam = lam_max * min(1.0, float(epoch + 1) / float(cur_epochs))
             loss_total = (1.0 - lam) * loss_self_sup_tensor + lam * sup["loss_sup_total"]
             metrics_pseudo_gt.update(sup["metrics"])
             metrics_pseudo_gt["pseudo_lambda"] = float(lam)
